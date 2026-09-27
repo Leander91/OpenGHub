@@ -609,11 +609,18 @@ impl DeviceManager {
             serde_json::to_string(macros).unwrap_or_default().hash(&mut h);
             h.finish()
         };
-        // With nothing assigned there is nothing to write: the device's own
-        // table is left as it is. Rewriting it from `factory_buttons` on every
-        // start wore the flash and, where that guess was wrong, broke keys.
-        let nothing_assigned = assignments.is_empty();
-        if onboard && (nothing_assigned || inner.onboard_written.get(id) == Some(&fingerprint)) {
+        // Every id the device goes by, for its factory table (see below).
+        let ids: Vec<u16> = inner
+            .snapshots
+            .get(id)
+            .map(|s| s.model_ids.iter().copied().chain([s.product_id]).collect())
+            .unwrap_or_default();
+        // With nothing assigned the table goes back to the factory one, so a
+        // binding removed in OpenGHub leaves the device too. Without a backup
+        // to take that table from, nothing is written. (Unchanged sectors are
+        // never rewritten, so this costs no flash.)
+        let no_factory = assignments.is_empty() && factory_buttons(&ids, 1).is_empty();
+        if onboard && (no_factory || inner.onboard_written.get(id) == Some(&fingerprint)) {
             report.onboard = true;
         } else if onboard {
             use crate::hidpp::onboard;
@@ -639,7 +646,7 @@ impl DeviceManager {
                 // Writing only the assigned ones let stale bindings pile up
                 // across profiles (a left click pointing at a dead macro).
                 let count = info.button_count as usize;
-                let factory = factory_buttons(product_id, count);
+                let factory = factory_buttons(&ids, count);
                 let mut buttons: Vec<(u8, bool, onboard::Button)> = Vec::new();
                 let mut macro_assignments: Vec<onboard::MacroAssignment> = Vec::new();
                 let mut covered = vec![false; count];
@@ -1527,22 +1534,34 @@ impl Inner {
 /// The factory button descriptors for a product, read from the oldest backup
 /// OpenGHub took of it — the first backup happens before the first write, so
 /// it is the table the mouse shipped with. Empty when there is no backup.
-pub fn factory_buttons(product_id: u16, count: usize) -> Vec<crate::hidpp::onboard::Button> {
+/// The button table of the oldest backup of any of `product_ids` — the state
+/// before OpenGHub first wrote anything. A device has one id per connection
+/// (a G915 is `c33e` wired and `b354` wireless), and the oldest backup may
+/// have been taken under either.
+pub fn factory_buttons(product_ids: &[u16], count: usize) -> Vec<crate::hidpp::onboard::Button> {
     use crate::hidpp::onboard::{self, Button, BUTTONS_OFFSET};
     let Some(dir) = crate::artwork::dir().parent().map(|d| d.join("backups")) else {
         return vec![];
     };
-    let prefix = format!("{product_id:04x}-");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+    // `<pid>-<unix seconds>.json`; the oldest stamp wins across ids.
+    let stamp_of = |p: &std::path::Path| -> Option<(u64, u16)> {
+        let name = p.file_stem()?.to_str()?;
+        let (pid, stamp) = name.split_once('-')?;
+        let pid = u16::from_str_radix(pid, 16).ok()?;
+        product_ids.contains(&pid).then_some(())?;
+        Some((stamp.parse().ok()?, pid))
+    };
+    let oldest = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with(&prefix)).unwrap_or(false))
-                .collect()
+                .filter_map(|p| stamp_of(&p).map(|s| (s, p)))
+                .min_by_key(|(s, _)| s.0)
+                .map(|(_, p)| p)
         })
-        .unwrap_or_default();
-    files.sort();
-    let Some(oldest) = files.first() else {
+        .ok()
+        .flatten();
+    let Some(oldest) = oldest else {
         return vec![];
     };
     let Ok(text) = std::fs::read_to_string(oldest) else {

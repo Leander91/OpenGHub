@@ -53,6 +53,10 @@ OpenGHub reads the launchers that exist on Linux, all read-only:
 - **Epic Games / GOG** — through Heroic's `store_cache/{legendary,gog}_library.json`.
 - **Lutris** — `lutris --list-games --installed --json`; entries whose runner is Steam are
   skipped because Steam already lists them.
+- **Faugus Launcher** — `~/.local/share/faugus-launcher/games.json` (or its Flatpak twin), with
+  its icons and covers, play time and last played; launched with `faugus-launcher --game <id>`.
+  Its games run under Proton without a Steam app id, so profile switching finds them by
+  executable name (it works for World of Warcraft through Battle.net).
 - **Manually installed** — any executable, added with **+** or under *Manage*; stored in the
   config with an optional cover.
 

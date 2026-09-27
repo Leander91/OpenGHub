@@ -27,6 +27,7 @@
     { id: "epic", label: "Epic Games", icon: "epic" },
     { id: "gog", label: "GOG", icon: "gog" },
     { id: "lutris", label: "Lutris", icon: "lutris" },
+    { id: "faugus", label: "Faugus", icon: "faugus" },
   ];
 
   const SOURCE_LABEL: Record<GameSource, string> = {
@@ -34,6 +35,7 @@
     epic: "Epic Games",
     gog: "GOG",
     lutris: "Lutris",
+    faugus: "Faugus",
     manual: "Manually installed",
   };
 
@@ -56,7 +58,7 @@
   let toSrc = $state<(p: string) => string>((p) => p);
 
   const counts = $derived.by(() => {
-    const c: Record<SourceFilter, number> = { all: games.length, manual: 0, steam: 0, epic: 0, gog: 0, lutris: 0 };
+    const c: Record<SourceFilter, number> = { all: games.length, manual: 0, steam: 0, epic: 0, gog: 0, lutris: 0, faugus: 0 };
     for (const g of games) c[g.source] += 1;
     return c;
   });

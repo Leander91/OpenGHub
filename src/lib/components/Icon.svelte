@@ -128,6 +128,8 @@
       '<path d="M12 3.5l7.5 4.5v8L12 20.5 4.5 16V8z"/><path d="M12 8v8"/><path d="M8.5 10l7 4M15.5 10l-7 4"/>',
     manual:
       '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M7.5 9l3 3-3 3"/><path d="M12.5 15h4"/>',
+    faugus:
+      '<rect x="4.5" y="4.5" width="15" height="15" rx="3"/><path d="M9 16V8h6"/><path d="M9 12h4.5"/>',
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
 
     // G HUB's pedals glyph: three pedal plates.

@@ -32,6 +32,8 @@ pub enum Source {
     Epic,
     Gog,
     Lutris,
+    /// Faugus Launcher (Windows games through UMU / Proton).
+    Faugus,
     Manual,
 }
 
@@ -42,6 +44,7 @@ impl Source {
             Source::Epic => "epic",
             Source::Gog => "gog",
             Source::Lutris => "lutris",
+            Source::Faugus => "faugus",
             Source::Manual => "manual",
         }
     }
@@ -553,6 +556,85 @@ fn which(bin: &str) -> bool {
     crate::sandbox::host_has(bin)
 }
 
+// ---------------------------------------------------------------------------
+// Faugus Launcher
+// ---------------------------------------------------------------------------
+
+/// `games.json` of Faugus Launcher, native and Flatpak.
+fn faugus_game_files() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    [
+        home.join(".local/share/faugus-launcher/games.json"),
+        home.join(".var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher/games.json"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect()
+}
+
+#[derive(Deserialize)]
+struct FaugusGame {
+    gameid: String,
+    title: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    icon: String,
+    #[serde(default)]
+    cover: String,
+    #[serde(default)]
+    hidden: bool,
+    /// Seconds.
+    #[serde(default)]
+    playtime: u64,
+    /// ISO 8601, local time.
+    #[serde(default)]
+    last_played: String,
+}
+
+/// `2026-09-27T13:13:21.476847` → Unix seconds (local time taken as UTC; only
+/// the order matters here).
+fn parse_iso_seconds(s: &str) -> u64 {
+    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(se)) = (n(0..4), n(5..7), n(8..10), n(11..13), n(14..16), n(17..19)) else {
+        return 0;
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y, mo) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * mo + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (days * 86_400 + h * 3600 + mi * 60 + se).max(0) as u64
+}
+
+pub fn scan_faugus() -> Vec<Game> {
+    let mut games = Vec::new();
+    for file in faugus_game_files() {
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let Ok(list) = serde_json::from_str::<Vec<FaugusGame>>(&text) else { continue };
+        for g in list.into_iter().filter(|g| !g.hidden && !g.gameid.is_empty()) {
+            let art = [g.cover.as_str(), g.icon.as_str()]
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .find_map(|p| cache_cover(Path::new(p), &format!("faugus-{}", g.gameid)));
+            games.push(Game {
+                id: format!("faugus:{}", g.gameid),
+                source: Source::Faugus,
+                name: g.title,
+                cover: art,
+                cover_url: None,
+                last_played: parse_iso_seconds(&g.last_played),
+                playtime_minutes: g.playtime / 60,
+                install_dir: Path::new(&g.path).parent().map(|p| p.to_string_lossy().into_owned()),
+                application_id: None,
+            });
+        }
+    }
+    games
+}
+
 pub fn scan_lutris() -> Vec<Game> {
     let Some(mut cmd) = lutris_command() else {
         return vec![];
@@ -660,6 +742,7 @@ pub fn scan(manual: &[ManualGame], db: &crate::apps::AppDatabase) -> Vec<Game> {
     let mut games = scan_steam();
     games.extend(scan_heroic());
     games.extend(scan_lutris());
+    games.extend(scan_faugus());
     games.extend(manual_games(manual));
 
     // The database loads in the background at startup; a scan that runs before
@@ -734,6 +817,14 @@ pub fn launch(game_id: &str, manual: &[ManualGame]) -> Result<()> {
             cmd.arg(format!("lutris:rungame/{key}"));
             spawn_detached(cmd)
         }
+        "faugus" => {
+            if key.is_empty() || key.contains(char::is_whitespace) {
+                return Err(Error::other("malformed Faugus game id"));
+            }
+            let mut cmd = crate::sandbox::host_command("faugus-launcher", &[]);
+            cmd.args(["--game", key]);
+            spawn_detached(cmd)
+        }
         "epic" => open_url(&format!("heroic://launch/legendary/{key}")),
         "gog" => open_url(&format!("heroic://launch/gog/{key}")),
         "manual" => {
@@ -757,6 +848,13 @@ pub fn launch(game_id: &str, manual: &[ManualGame]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faugus_timestamps() {
+        assert_eq!(parse_iso_seconds("1970-01-01T00:00:10.5"), 10);
+        assert_eq!(parse_iso_seconds("2026-09-27T13:13:21.476847"), 1_790_514_801);
+        assert_eq!(parse_iso_seconds(""), 0);
+    }
 
     #[test]
     fn parses_appmanifest() {

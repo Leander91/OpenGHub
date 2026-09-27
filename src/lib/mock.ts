@@ -402,6 +402,27 @@ export async function mockInvoke<T>(command: string, args: Record<string, unknow
       })) as T;
     }
 
+    case "set_profile_lock": {
+      const locks = (config.settings.locks ??= {});
+      const id = args.deviceId as string;
+      const list = (locks[id] ?? []).filter((f) => f !== args.feature);
+      if (args.locked) list.push(args.feature as string);
+      locks[id] = list;
+      return persist() as T;
+    }
+
+    case "set_game_mode": {
+      const id = args.deviceId as string;
+      const on = (config.settings.gameModeDevices ?? []).filter((d) => d !== id);
+      if (args.on) on.push(id);
+      config.settings.gameModeDevices = on;
+      return persist() as T;
+    }
+
+    case "set_per_key_lighting":
+    case "reapply_lighting":
+      return undefined as T;
+
     case "save_settings":
       config.settings = JSON.parse(JSON.stringify(args.settings)) as Config["settings"];
       return persist() as T;

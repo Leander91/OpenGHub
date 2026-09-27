@@ -179,6 +179,10 @@ slots page enables and disables them (never the last one) and writes a profile's
 lighting and plain button bindings into a slot; on a keyboard with M-keys, slot N takes the MN
 bindings. Every write is backed up first, and unchanged sectors are not written at all.
 
+When a profile has nothing assigned, the button table goes back to the factory one, taken from
+the oldest backup under any of the device's ids (a device has a different product id wired and
+wireless). Without such a backup nothing is written.
+
 A lesson from v0.1.3 (#1): special button descriptors carry parameter bytes (`90 0d ff 01` is
 "switch to profile 1" on a G915), and the left-click guard must only apply to mice.
 `cargo run --example restore_sector` restores single sectors from a backup, verifying by reading

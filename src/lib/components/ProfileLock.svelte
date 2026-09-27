@@ -18,10 +18,11 @@
   const locked = $derived((configStore.settings.locks?.[deviceId] ?? []).includes(feature));
 
   async function toggle() {
+    const locking = !locked;
     try {
-      configStore.apply(await api.setProfileLock(deviceId, feature, !locked));
+      configStore.apply(await api.setProfileLock(deviceId, feature, locking));
       ui.toast(
-        locked ? "Now set per profile." : "Locked: the same in every profile, from this one.",
+        locking ? "Locked: the same in every profile, from this one." : "Now set per profile.",
         "success",
         2500,
       );
@@ -31,25 +32,51 @@
   }
 </script>
 
-<button class="lock" class:on={locked} onclick={toggle} title={locked ? "Same in every profile — click to set per profile" : "Set per profile — click to use the same in every profile"}>
-  <Icon name="lock" size={14} />
-  <span>{locked ? "Persistent configuration" : "Per-profile configuration"}</span>
+<button class="lock" class:on={locked} onclick={toggle} title={locked ? "Click to set per profile again" : "Click to use these settings in every profile"}>
+  <Icon name="lock" size={16} strokeWidth={locked ? 2.2 : 1.6} />
+  <span class="text">
+    <strong>{locked ? "Locked: same in every profile" : "Per profile"}</strong>
+    <small>{locked ? "Click to unlock" : "Click the lock to use these settings in every profile"}</small>
+  </span>
 </button>
 
 <style>
   .lock {
     display: flex;
     align-items: center;
-    gap: 8px;
-    align-self: flex-start;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text-dimmer);
+    gap: 10px;
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    text-align: left;
+    color: var(--text-dim);
+  }
+
+  .lock:hover {
+    background: var(--surface-2);
   }
 
   .lock.on {
-    color: var(--primary, #1196ff);
+    border-color: var(--accent, #1196ff);
+    color: var(--accent, #1196ff);
+  }
+
+  .text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  small {
+    font-size: 11px;
+    color: var(--text-dimmer);
   }
 </style>

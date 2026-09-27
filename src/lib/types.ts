@@ -471,7 +471,7 @@ export interface Config {
 
 // -- games library ----------------------------------------------------------
 
-export type GameSource = "steam" | "epic" | "gog" | "lutris" | "manual";
+export type GameSource = "steam" | "epic" | "gog" | "lutris" | "faugus" | "manual";
 
 /** One installed game, gathered from a launcher on this machine. */
 export interface Game {
