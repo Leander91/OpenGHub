@@ -23,6 +23,13 @@ const devices: Device[] = [
     zones: 1,
     onboard: true,
   }),
+  makeDevice("demo-g915", "G915 LIGHTSPEED", "keyboard", 0xc33e, {
+    connection: "wired",
+    battery: 90,
+    zones: 2,
+    onboard: true,
+    perKey: true,
+  }),
   makeDevice("demo-prox2", "PRO X 2 LIGHTSPEED", "headset", 0x0afe, {
     connection: "wireless",
     battery: 17,
@@ -45,6 +52,8 @@ interface Options {
   zones?: number;
   onboard?: boolean;
   wheel?: boolean;
+  /** Per-key lighting (and Game Mode, as for any keyboard). */
+  perKey?: boolean;
 }
 
 function makeDevice(
@@ -73,6 +82,8 @@ function makeDevice(
       battery: o.battery !== undefined,
       lighting: !!o.zones,
       onboardMemory: !!o.onboard,
+      perKey: !!o.perKey,
+      gameMode: kind === "keyboard",
       wheel: !!o.wheel,
     },
     battery:

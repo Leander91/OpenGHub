@@ -683,7 +683,11 @@ pub fn scan(manual: &[ManualGame], db: &crate::apps::AppDatabase) -> Vec<Game> {
         g.application_id = steam_id
             .and_then(|s| by_steam.get(s))
             .or_else(|| by_name.get(&g.name.to_lowercase()))
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            // Not in Logitech's list (War Thunder is not): the game is its
+            // own application, so it can still carry a profile. Steam games
+            // are detected by `SteamAppId` like listed ones.
+            .or_else(|| Some(g.id.clone()));
     }
 
     games.sort_by(|a, b| b.last_played.cmp(&a.last_played).then_with(|| a.name.cmp(&b.name)));

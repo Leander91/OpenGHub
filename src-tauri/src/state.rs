@@ -33,6 +33,12 @@ pub struct Capabilities {
     pub battery: bool,
     pub lighting: bool,
     pub onboard_memory: bool,
+    /// Individually lit keys (0x8081): Freestyle and animations.
+    #[serde(default)]
+    pub per_key: bool,
+    /// Keys the host can disable (0x4522): Game Mode.
+    #[serde(default)]
+    pub game_mode: bool,
     /// A racing wheel driven through the classic command channel.
     #[serde(default)]
     pub wheel: bool,
@@ -160,6 +166,21 @@ pub struct AssignmentReport {
 
 /// A button edge on a device the pump is watching. `action` is `None` for
 /// buttons without an assignment; scripts still hear about those.
+/// One on-board memory slot (G HUB's ON-BOARD MEMORY SLOTS).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardSlot {
+    pub index: u8,
+    pub sector: u16,
+    /// Can be cycled to and used.
+    pub enabled: bool,
+    /// The slot the device is running now.
+    pub active: bool,
+}
+
+/// `ButtonEvent::button` of a keyboard's MR key.
+pub const MR_BUTTON: u8 = 0xfe;
+
 #[derive(Debug, Clone)]
 pub struct ButtonEvent {
     pub device_id: String,
@@ -540,16 +561,17 @@ impl DeviceManager {
             if let Some(m) = midx {
                 let _ = h.call(m, features::mkeys::FN_SET_LEDS, &[1 << (state - 1)], ReportKind::Long);
             }
-            Ok(Some((idx, count, midx)))
+            let mr = h.feature_index(features::mr::ID).ok();
+            Ok(Some((idx, count, midx, mr)))
         });
         match gkeys {
-            Ok(Some((idx, count, midx))) => {
+            Ok(Some((idx, count, midx, mr))) => {
                 report.software = true;
                 inner.gkey_index.insert(id.to_string(), idx);
                 inner.plans.insert(id.to_string(), remap::gkey_plan(all_assignments, macros, count, state));
                 inner.mkeys.insert(
                     id.to_string(),
-                    MKeys { index: midx, count, state, assignments: all_assignments.to_vec(), macros: macros.to_vec() },
+                    MKeys { index: midx, mr, count, state, assignments: all_assignments.to_vec(), macros: macros.to_vec() },
                 );
             }
             Ok(None) => {}
@@ -698,6 +720,16 @@ impl DeviceManager {
                 // their own LED.
                 let mut new_state = None;
                 if let Some(mk) = inner.mkeys.get(&id) {
+                    // MR goes to the recorder in lib.rs as its own button.
+                    for ev in events.iter().filter(|ev| Some(ev.feature_index) == mk.mr && ev.function_id() == 0) {
+                        out.push(ButtonEvent {
+                            device_id: id.clone(),
+                            button: MR_BUTTON,
+                            pressed: ev.param(0) & 1 != 0,
+                            action: Some(Action::MacroRecord),
+                            wheel: false,
+                        });
+                    }
                     for ev in &events {
                         if Some(ev.feature_index) == mk.index && ev.function_id() == 0 && ev.param(0) & 0x07 != 0 {
                             new_state = Some(ev.param(0).trailing_zeros() as u8 + 1);
@@ -794,6 +826,10 @@ impl DeviceManager {
                     }
                     let _ = features::set_spy(h, false);
                     let _ = features::write_remapping(h, &table);
+                }
+                // Game Mode must never outlive the app.
+                if h.supports(features::disable_keys::ID) {
+                    let _ = features::set_disabled_keys(h, &[]);
                 }
                 if let Ok(idx) = h.feature_index(features::gkeys::ID) {
                     let _ = h.call(idx, features::gkeys::FN_SOFTWARE_CONTROL, &[0x00], ReportKind::Long);
@@ -1109,6 +1145,131 @@ impl DeviceManager {
             }
             Ok(written)
         })
+    }
+
+    /// Per-key colours by LED id (0x8081).
+    pub fn set_per_key(&self, id: &str, leds: &[(u8, [u8; 3])]) -> Result<()> {
+        self.set_per_key_frame(id, leds, true)
+    }
+
+    /// One animation frame; `take_over` only for the first.
+    pub fn set_per_key_frame(&self, id: &str, leds: &[(u8, [u8; 3])], take_over: bool) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        inner.with_handle(id, |h| features::write_per_key_frame(h, leds, take_over))
+    }
+
+    /// G HUB's on-board memory slots: each profile slot, whether it can be
+    /// cycled to, and which one the device is running.
+    pub fn onboard_slots(&self, id: &str) -> Result<Vec<OnboardSlot>> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let dir = onboard::parse_directory(&onboard::read_sector(h, 0, info.sector_size as usize, true)?);
+            let idx = h.feature_index(onboard::ID)?;
+            let current = h.call(idx, onboard::FN_GET_CURRENT_PROFILE, &[], ReportKind::Long).map(|p| p.param_u16(0)).ok();
+            Ok(dir
+                .iter()
+                .enumerate()
+                .map(|(i, e)| OnboardSlot { index: i as u8, sector: e.sector, enabled: e.enabled, active: current == Some(e.sector) })
+                .collect())
+        })
+    }
+
+    /// Enables or disables one slot in the directory (sector 0). The last
+    /// enabled slot cannot be disabled. Backs up first.
+    pub fn set_onboard_slot_enabled(&self, id: &str, index: u8, enabled: bool) -> Result<()> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        let product_id = inner.snapshots.get(id).map(|s| s.product_id).unwrap_or(0);
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let size = info.sector_size as usize;
+            let mut dir = onboard::read_sector(h, 0, size, true)?;
+            let entries = onboard::parse_directory(&dir);
+            let at = index as usize;
+            if at >= entries.len() {
+                return Err(Error::other(format!("slot {} does not exist", index + 1)));
+            }
+            if !enabled && entries.iter().enumerate().all(|(i, e)| i == at || !e.enabled) {
+                return Err(Error::other("at least one on-board slot has to stay enabled"));
+            }
+            write_backup(&onboard::backup(h, id, product_id)?)?;
+            dir[at * 4 + 2] = enabled as u8;
+            onboard::write_sector(h, 0, &dir)
+        })
+    }
+
+    /// Writes DPI, lighting and plain button bindings into one slot.
+    /// Buttons not listed, and every macro, stay as they are. Backs up first.
+    pub fn write_onboard_slot(
+        &self,
+        id: &str,
+        index: u8,
+        dpi: Option<(Vec<u16>, u8, u8, Option<u32>)>,
+        leds: &[(u8, u8, [u8; 10])],
+        buttons: &[(u8, crate::hidpp::onboard::Button)],
+    ) -> Result<()> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        let product_id = inner.snapshots.get(id).map(|s| s.product_id).unwrap_or(0);
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let size = info.sector_size as usize;
+            let dir = onboard::parse_directory(&onboard::read_sector(h, 0, size, true)?);
+            let sector = dir
+                .get(index as usize)
+                .map(|e| e.sector)
+                .ok_or_else(|| Error::other(format!("slot {} does not exist", index + 1)))?;
+            write_backup(&onboard::backup(h, id, product_id)?)?;
+            if let Some((stages, default, shift, rate)) = &dpi {
+                if !stages.is_empty() {
+                    onboard::write_dpi_table(h, sector, stages, *default, *shift, *rate, &info)?;
+                }
+            }
+            if !leds.is_empty() {
+                onboard::write_leds(h, sector, leds, &info)?;
+            }
+            if !buttons.is_empty() {
+                let mut raw = onboard::read_sector(h, sector, size, true)?;
+                for (i, b) in buttons {
+                    if *i < info.button_count {
+                        let at = onboard::button_offset(*i, false);
+                        raw[at..at + 4].copy_from_slice(&b.encode());
+                    }
+                }
+                onboard::write_sector(h, sector, &raw)?;
+            }
+            Ok(())
+        })?;
+        inner.with_handle(id, reload_onboard_profile)
+    }
+
+    /// The MR key's LED, for recording feedback.
+    pub fn set_mr_led(&self, id: &str, on: bool) {
+        let mut inner = self.inner.lock();
+        let Some(mr) = inner.mkeys.get(id).and_then(|m| m.mr) else { return };
+        let _ = inner.with_handle(id, |h| h.call(mr, features::mr::FN_SET_LED, &[on as u8], ReportKind::Long).map(|_| ()));
+    }
+
+    /// The keyboard's current M-state (1-3), for binding a recording to it.
+    pub fn m_state(&self, id: &str) -> u8 {
+        self.inner.lock().mkeys.get(id).map(|m| m.state).unwrap_or(1)
+    }
+
+    /// Game Mode: disables exactly these HID keyboard usages (0x4522).
+    pub fn set_disabled_keys(&self, id: &str, usages: &[u8]) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        inner.with_handle(id, |h| features::set_disabled_keys(h, usages))
     }
 
     pub fn enumerate_features(&self, id: &str) -> Result<Vec<(u16, u8, u8)>> {
@@ -1483,6 +1644,8 @@ fn wheel_evdev_nodes(hidraw_path: &str) -> Vec<String> {
 /// A keyboard's M-key state; see `Inner::mkeys`.
 struct MKeys {
     index: Option<u8>,
+    /// 0x8030, the MR key.
+    mr: Option<u8>,
     count: u8,
     state: u8,
     assignments: Vec<Assignment>,
@@ -1567,6 +1730,9 @@ fn probe(handle: &mut Handle, snapshot: &mut DeviceSnapshot, endpoint: &hidpp::E
         lighting: handle.supports(features::lighting::ID_COLOR_LED_EFFECTS)
             || handle.supports(features::lighting::ID_RGB_EFFECTS),
         onboard_memory: handle.supports(0x8100),
+        per_key: handle.supports(features::per_key::ID) && snapshot.kind == DeviceKind::Keyboard,
+        // Done in software (gamemode.rs), so any keyboard can have it.
+        game_mode: snapshot.kind == DeviceKind::Keyboard,
         wheel: false,
     };
 

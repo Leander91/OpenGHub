@@ -53,6 +53,10 @@ export interface Capabilities {
   battery: boolean;
   lighting: boolean;
   onboardMemory: boolean;
+  /** Individually lit keys: Freestyle. */
+  perKey?: boolean;
+  /** Keys the host can disable: Game Mode. */
+  gameMode?: boolean;
   /** A racing wheel driven through the classic command channel. */
   wheel?: boolean;
 }
@@ -176,7 +180,21 @@ export interface FeatureInfo {
   hidden: boolean;
 }
 
-export type LightEffectName = "off" | "fixed" | "breathing" | "cycle" | "screen" | "audio";
+export type LightEffectName =
+  | "off" | "fixed" | "breathing" | "cycle" | "wave" | "ripple" | "freestyle" | "animation" | "commands" | "screen" | "audio";
+
+/** One animation frame: per-key colours by LED id, and how long it shows. */
+export interface AnimationFrame {
+  keys: Record<string, string>;
+  durationMs: number;
+}
+
+export interface Animation {
+  name: string;
+  frames: AnimationFrame[];
+  cycle: "cycle" | "reverse" | "bounce" | "random";
+  transition: "none" | "fade";
+}
 
 /** A screen region as fractions of the monitor. */
 export interface Region {
@@ -213,6 +231,8 @@ export interface LightingSettings {
   brightness: number;
   rateMs: number;
   software?: SoftwareEffect | null;
+  /** Colour wave direction code (1 = horizontal). */
+  direction?: number | null;
 }
 
 export interface Assignment {
@@ -261,6 +281,14 @@ export interface DeviceProfile {
   macros: MacroDef[];
   /** Steering wheel settings, for wheels. */
   wheel?: WheelSettings | null;
+  /** Freestyle colours by per-key LED id. */
+  perKey?: Record<string, string>;
+  /** Game Mode's disabled keys (HID usages); unset = Windows and Menu keys. */
+  gameModeKeys?: number[] | null;
+  /** Keyboard animation, shown when a zone's effect is `animation`. */
+  animation?: Animation | null;
+  /** Command lighting colours by group; "" = no colour. */
+  commandColors?: Record<string, string>;
 }
 
 /** An entry from Logitech's public application database. */
@@ -277,6 +305,14 @@ export interface ApplicationCommand {
   category: string;
   name: string;
   keystroke: string[];
+}
+
+/** One on-board memory slot. */
+export interface OnboardSlot {
+  index: number;
+  sector: number;
+  enabled: boolean;
+  active: boolean;
 }
 
 export interface ApplicationCommands {
@@ -332,6 +368,10 @@ export interface Settings {
   screenRestoreToken?: string | null;
   /** Devices switched to on-board memory mode. */
   onboardModeDevices?: string[];
+  /** Keyboards with Game Mode on. */
+  gameModeDevices?: string[];
+  /** Per-profile locks: device id → features kept the same in every profile. */
+  locks?: Record<string, string[]>;
   /** "Don't ask again" on the first-run device-permissions dialog. */
   udevSetupDismissed?: boolean;
 }
@@ -516,4 +556,5 @@ export interface LightingRequest {
   rateMs: number;
   /** Also write the device's flash, so the effect survives a reconnect. */
   persist?: boolean;
+  direction?: number | null;
 }

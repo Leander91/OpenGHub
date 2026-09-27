@@ -84,6 +84,7 @@ pub const KEY_PREVIOUSSONG: u16 = 165;
 pub const KEY_STOPCD: u16 = 166;
 pub const KEY_HOMEPAGE: u16 = 172;
 pub const KEY_REFRESH: u16 = 173;
+pub const KEY_102ND: u16 = 86;
 pub const KEY_F13: u16 = 183;
 pub const KEY_F24: u16 = 194;
 pub const KEY_SEARCH: u16 = 217;
@@ -309,7 +310,10 @@ pub fn usage_code(usage: u8) -> Option<u16> {
         0x59..=0x61 => numpad_code((usage - 0x59 + 1) as u16)?,
         0x62 => KEY_KP0,
         0x63 => KEY_KPDOT,
+        // The ISO key beside left Shift: `< >` on Nordic and German layouts.
+        0x64 => KEY_102ND,
         0x65 => KEY_COMPOSE,
+        0x68..=0x73 => KEY_F13 + (usage - 0x68) as u16,
         _ => return None,
     })
 }
@@ -324,7 +328,7 @@ pub fn modifier_codes(mask: u8) -> Vec<u16> {
 
 /// The reverse: a key code → HID usage / modifier bit, for onboard profiles.
 pub fn usage_for_code(code: u16) -> Option<u8> {
-    (0x04..=0x65u8).find(|u| usage_code(*u) == Some(code))
+    (0x04..=0x73u8).find(|u| usage_code(*u) == Some(code))
 }
 
 pub fn modifier_bit_for_code(code: u16) -> Option<u8> {

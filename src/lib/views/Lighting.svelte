@@ -3,6 +3,7 @@
    * LIGHTSYNC — one tab per addressable zone, as G HUB does. Each zone carries
    * its own effect and colour; "sync zones" copies the active one to the rest.
    */
+  import ProfileLock from "$lib/components/ProfileLock.svelte";
   import { untrack } from "svelte";
   import * as api from "$lib/api";
   import ColorWheel from "$lib/components/ColorWheel.svelte";
@@ -11,12 +12,14 @@
   import Icon from "$lib/components/Icon.svelte";
   import RegionPicker from "$lib/components/RegionPicker.svelte";
   import Slider from "$lib/components/Slider.svelte";
+  import KeyboardMap from "$lib/components/KeyboardMap.svelte";
+  import { G915_IDS, G915_KEYS, G915_SIZE, type Key } from "$lib/keyboards/g915";
   import { artworkIds, batteryIcon, batteryLabel } from "$lib/device-ui";
   import { artwork } from "$lib/stores/artwork.svelte";
   import { configStore } from "$lib/stores/config.svelte";
   import { deviceStore } from "$lib/stores/devices.svelte";
   import { ui } from "$lib/stores/ui.svelte";
-  import type { Device, LightEffectName, LightingSettings, SoftwareEffect, ZoneInfo } from "$lib/types";
+  import type { Animation, Device, LightEffectName, LightingSettings, SoftwareEffect, ZoneInfo } from "$lib/types";
   import type { ZoneSpot } from "$lib/zones";
 
   interface Props {
@@ -30,13 +33,33 @@
     0x01: "fixed",
     0x03: "cycle",
     0x0a: "breathing",
+    0x04: "wave",
+    0x0b: "ripple",
   };
+
+  /**
+   * Colour wave directions by device code. Only horizontal (1) is confirmed
+   * on a G915 so far; the rest follow G HUB's list and are offered for it.
+   */
+  const WAVE_DIRECTIONS: { code: number; label: string }[] = [
+    { code: 1, label: "Horizontal" },
+    { code: 2, label: "Vertical" },
+    { code: 3, label: "Centre out" },
+    { code: 8, label: "Centre in" },
+    { code: 6, label: "Reverse horizontal" },
+    { code: 7, label: "Reverse vertical" },
+  ];
 
   const EFFECT_LABEL: Record<LightEffectName, string> = {
     off: "Off",
     fixed: "Fixed",
     breathing: "Breathing",
     cycle: "Cycle",
+    wave: "Colour wave",
+    ripple: "Ripple",
+    freestyle: "Freestyle",
+    animation: "Animation",
+    commands: "Command lighting",
     screen: "Screen sampler",
     audio: "Audio visualizer",
   };
@@ -86,13 +109,171 @@
   const hasLayout = $derived(artwork.layoutFor(artworkIds(device)) !== null);
   let syncingOptions = $state(false);
   const zoneInfo = $derived(zones.find((z) => z.index === activeZone));
+  /** The drawn key map, for keyboards OpenGHub has one for. */
+  const keyMap = $derived(
+    device.capabilities.perKey && artworkIds(device).some((id) => G915_IDS.includes(id))
+      ? { keys: G915_KEYS, size: G915_SIZE }
+      : null,
+  );
   /** Only offer effects this particular zone advertises. */
   const available = $derived([
     ...(zoneInfo?.effects ?? [0x00, 0x01, 0x03, 0x0a])
       .map((id) => EFFECT_BY_ID[id])
       .filter((name): name is LightEffectName => !!name),
+    ...(keyMap ? (["freestyle", "animation"] as LightEffectName[]) : []),
+    ...(keyMap && configStore.active?.applicationId ? (["commands"] as LightEffectName[]) : []),
     ...SOFTWARE,
   ]);
+
+  // -- Freestyle: a colour per key ---------------------------------------------------
+
+  /** Freestyle colours by LED id. */
+  let perKey = $state<Record<string, string>>({});
+  const perKeyFill = $derived(
+    Object.fromEntries(
+      (keyMap?.keys ?? []).flatMap((k) => (k.led !== undefined && perKey[k.led] ? [[k.id, perKey[k.led]]] : [])),
+    ),
+  );
+
+  // -- Command lighting: the game's command groups, in their colours ------------------------
+
+  let commandGroups = $state<{ tag: string; hex: string; count: number }[]>([]);
+  /** The user's colour per group ("" = no colour), over the game's own. */
+  let commandColors = $state<Record<string, string>>({});
+
+  /** Sets a group to the colour chosen on the wheel, or to no colour. */
+  async function colourGroup(tag: string, none = false) {
+    commandColors = { ...commandColors, [tag]: none ? "" : current.color };
+    try {
+      await persist();
+      await api.reapplyLighting();
+    } catch (e) {
+      ui.toast(api.errorMessage(e), "error");
+    }
+  }
+  $effect(() => {
+    const appId = configStore.active?.applicationId;
+    if (current.effect !== "commands" || !appId) return;
+    api
+      .getApplicationCommands(appId)
+      .then((c) => {
+        commandGroups = c.categoryColors.map((g) => ({
+          tag: g.tag,
+          hex: g.hex,
+          count: c.commands.filter((x) => x.category === g.tag).length,
+        }));
+      })
+      .catch(() => (commandGroups = []));
+  });
+
+  // -- Animation: Freestyle frames played in turn --------------------------------------
+
+  let animation = $state<Animation>({ name: "Animation", frames: [{ keys: {}, durationMs: 300 }], cycle: "cycle", transition: "fade" });
+  let frameIndex = $state(0);
+  const frame = $derived(animation.frames[Math.min(frameIndex, animation.frames.length - 1)]);
+  const frameFill = $derived(
+    Object.fromEntries(
+      (keyMap?.keys ?? []).flatMap((k) => (k.led !== undefined && frame?.keys[k.led] ? [[k.id, frame.keys[k.led]]] : [])),
+    ),
+  );
+
+  function setAnimation(next: Animation) {
+    animation = next;
+    void persist().then(() => api.reapplyLighting()).catch((e) => ui.toast(api.errorMessage(e), "error"));
+  }
+
+  function paintFrame(keys: Key[]) {
+    const f = { ...frame, keys: { ...frame.keys } };
+    for (const k of keys) {
+      if (k.led === undefined) continue;
+      if (current.color.toLowerCase() === "#000000") delete f.keys[k.led];
+      else f.keys[k.led] = current.color;
+    }
+    setAnimation({ ...animation, frames: animation.frames.map((x, i) => (i === frameIndex ? f : x)) });
+  }
+
+  function addFrame() {
+    // A copy of the current frame: small changes per frame are the usual way.
+    const frames = [...animation.frames];
+    frames.splice(frameIndex + 1, 0, { keys: { ...frame.keys }, durationMs: frame.durationMs });
+    frameIndex += 1;
+    setAnimation({ ...animation, frames });
+  }
+
+  function deleteFrame() {
+    if (animation.frames.length <= 1) return;
+    const frames = animation.frames.filter((_, i) => i !== frameIndex);
+    frameIndex = Math.max(0, frameIndex - 1);
+    setAnimation({ ...animation, frames });
+  }
+
+  /** OpenGHub's own starting points, generated from the key map. */
+  function preset(kind: "scanner" | "rows") {
+    const keys = keyMap?.keys ?? [];
+    const cols = Math.ceil(Math.max(...keys.map((k) => k.x + k.w)));
+    const hue = (h: number) => {
+      const f = (n: number) => {
+        const k = (n + h / 60) % 6;
+        return Math.round(255 * (1 - Math.max(0, Math.min(k, 4 - k, 1))));
+      };
+      return `#${[f(5), f(3), f(1)].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+    };
+    const lit = (pred: (k: Key) => boolean, colour: string) =>
+      Object.fromEntries(keys.flatMap((k) => (k.led !== undefined && pred(k) ? [[k.led, colour]] : [])));
+    const frames =
+      kind === "scanner"
+        ? Array.from({ length: cols }, (_, c) => ({
+            keys: lit((k) => k.x <= c + 0.5 && k.x + k.w > c - 0.5, current.color),
+            durationMs: 60,
+          }))
+        : Array.from({ length: 12 }, (_, i) => ({
+            keys: Object.fromEntries(keys.flatMap((k) => (k.led !== undefined ? [[k.led, hue((k.y * 45 + i * 30) % 360)]] : []))),
+            durationMs: 250,
+          }));
+    frameIndex = 0;
+    setAnimation({
+      name: kind === "scanner" ? "Scanner" : "Rainbow rows",
+      frames,
+      cycle: kind === "scanner" ? "bounce" : "cycle",
+      transition: kind === "scanner" ? "none" : "fade",
+    });
+  }
+
+  function paint(keys: Key[]) {
+    const next = { ...perKey };
+    for (const k of keys) {
+      if (k.led === undefined) continue;
+      // Black is "off", as in G HUB.
+      if (current.color.toLowerCase() === "#000000") delete next[k.led];
+      else next[k.led] = current.color;
+    }
+    perKey = next;
+    void apply(activeZone);
+  }
+
+  function paintAll(on: boolean) {
+    perKey = on
+      ? Object.fromEntries((keyMap?.keys ?? []).flatMap((k) => (k.led !== undefined ? [[k.led, current.color]] : [])))
+      : {};
+    void apply(activeZone);
+  }
+
+  /** Freestyle is keyboard-wide: choosing it, or leaving it, moves every zone. */
+  function setEffect(effect: LightEffectName) {
+    const wide = (e: LightEffectName) => e === "freestyle" || e === "animation" || e === "commands";
+    const wasWide = wide(current.effect);
+    if (wide(effect) || wasWide) {
+      byZone = Object.fromEntries(Object.entries(byZone).map(([z, l]) => [z, { ...l, effect }]));
+      if (!wide(effect)) {
+        // Every zone gets the new effect, not only the one in view.
+        void Promise.all(zones.map((z) => apply(z.index)));
+        return;
+      }
+    } else {
+      update({ effect });
+    }
+    void apply(activeZone);
+  }
 
   /** The active zone's software parameters, with defaults for its kind. */
   const software = $derived.by<SoftwareEffect | null>(() => {
@@ -132,8 +313,11 @@
 
   $effect(() => {
     const id = device.id;
-    if (seededFor === id) return;
-    seededFor = id;
+    // Per profile too: switching profiles with this page open must show the
+    // new profile's settings, or the next edit saves the old ones into it.
+    const key = `${configStore.activeProfileId}:${id}`;
+    if (seededFor === key) return;
+    seededFor = key;
     untrack(() => load(id));
   });
 
@@ -147,6 +331,10 @@
     }
 
     const profile = configStore.deviceProfile(id);
+    perKey = { ...(profile.perKey ?? {}) };
+    if (profile.animation?.frames?.length) animation = profile.animation;
+    commandColors = { ...(profile.commandColors ?? {}) };
+    frameIndex = 0;
     const seeded: Record<string, LightingSettings> = {};
     for (const zone of zones) {
       const key = String(zone.index);
@@ -191,6 +379,19 @@
     if (!settings) return;
     applying = true;
     try {
+      if (settings.effect === "animation" || settings.effect === "commands") {
+        await persist();
+        await api.reapplyLighting();
+        return;
+      }
+      if (settings.effect === "freestyle") {
+        await api.setPerKeyLighting(
+          device.id,
+          Object.entries(perKey).map(([led, color]) => ({ led: Number(led), color })),
+        );
+        await persist();
+        return;
+      }
       if (SOFTWARE.includes(settings.effect)) {
         const fx = settings.software && settings.software.kind === settings.effect
           ? settings.software
@@ -213,6 +414,7 @@
         brightness: settings.brightness,
         rateMs: settings.rateMs,
         persist: true,
+        direction: settings.direction ?? 1,
       });
       await persist();
     } catch (e) {
@@ -227,6 +429,9 @@
     await configStore.saveDeviceProfile(device.id, {
       ...profile,
       lightingZones: { ...byZone },
+      perKey: { ...perKey },
+      animation: $state.snapshot(animation),
+      commandColors: { ...commandColors },
       lighting: byZone[String(activeZone)] ?? profile.lighting,
       zonePositions: { ...positions },
       zoneNames: zones.map((z) => z.locationName),
@@ -348,6 +553,7 @@
 
 <DeviceWorkspace title="LIGHTSYNC">
   {#snippet panel()}
+    <ProfileLock deviceId={device.id} feature="lighting" />
     {#if loading}
       <p class="hint">Reading lighting zones…</p>
     {:else}
@@ -372,10 +578,7 @@
         <div class="select">
           <select
             value={current.effect}
-            onchange={(e) => {
-              update({ effect: e.currentTarget.value as LightEffectName });
-              apply(activeZone);
-            }}
+            onchange={(e) => setEffect(e.currentTarget.value as LightEffectName)}
           >
             {#each available as name (name)}
               <option value={name}>{EFFECT_LABEL[name]}</option>
@@ -384,7 +587,40 @@
         </div>
       </div>
 
-      {#if current.effect === "fixed" || current.effect === "breathing"}
+      {#if current.effect === "animation"}
+        <Slider
+          value={frame?.durationMs ?? 300}
+          min={50}
+          max={1000}
+          step={10}
+          label="Frame {frameIndex + 1} length"
+          suffix="ms"
+          oninput={(v) => (animation = { ...animation, frames: animation.frames.map((x, i) => (i === frameIndex ? { ...x, durationMs: v } : x)) })}
+          onchange={() => setAnimation(animation)}
+        />
+        <div class="field">
+          <span class="label">Cycle</span>
+          <div class="select">
+            <select value={animation.cycle} onchange={(e) => setAnimation({ ...animation, cycle: e.currentTarget.value as Animation["cycle"] })}>
+              <option value="cycle">Cycle</option>
+              <option value="reverse">Reverse cycle</option>
+              <option value="bounce">Bounce</option>
+              <option value="random">Random</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <span class="label">Transition</span>
+          <div class="select">
+            <select value={animation.transition} onchange={(e) => setAnimation({ ...animation, transition: e.currentTarget.value as Animation["transition"] })}>
+              <option value="fade">Fade</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+        </div>
+      {/if}
+
+      {#if current.effect === "fixed" || current.effect === "breathing" || current.effect === "ripple" || current.effect === "freestyle" || current.effect === "animation" || current.effect === "commands"}
         <div class="field">
           <span class="label">Colour</span>
           <ColorWheel
@@ -399,13 +635,46 @@
         </div>
       {/if}
 
-      {#if current.effect === "breathing" || current.effect === "cycle"}
+      {#if current.effect === "breathing" || current.effect === "cycle" || current.effect === "wave"}
         <Slider
-          value={current.rateMs}
-          min={500}
+          value={Math.max(current.effect === "wave" ? 1000 : 500, current.rateMs)}
+          min={current.effect === "wave" ? 1000 : 500}
           max={20000}
           step={500}
           label="Effect rate"
+          suffix="ms"
+          oninput={(v) => update({ rateMs: v })}
+          onchange={() => apply(activeZone)}
+        />
+      {/if}
+
+      {#if current.effect === "wave"}
+        <div class="field">
+          <span class="label">Direction</span>
+          <div class="select">
+            <select
+              value={current.direction ?? 1}
+              onchange={(e) => {
+                update({ direction: Number(e.currentTarget.value) });
+                apply(activeZone);
+              }}
+            >
+              {#each WAVE_DIRECTIONS as d (d.code)}
+                <option value={d.code}>{d.label}</option>
+              {/each}
+            </select>
+          </div>
+        </div>
+      {/if}
+
+      {#if current.effect === "ripple"}
+        <!-- G HUB's ripple rate runs from 200 ms (slow) to 2 ms (fast). -->
+        <Slider
+          value={Math.min(200, Math.max(2, current.rateMs))}
+          min={2}
+          max={200}
+          step={1}
+          label="Ripple rate"
           suffix="ms"
           oninput={(v) => update({ rateMs: v })}
           onchange={() => apply(activeZone)}
@@ -548,26 +817,161 @@
   {/snippet}
 
   {#snippet stage()}
-    <DeviceArt
-      kind={device.kind}
-      productIds={artworkIds(device)}
-      zones={glows}
-      zoneProductIds={artworkIds(device)}
-      zoneOverrides={positions}
-      {editZones}
-      onzonemove={moveZone}
-      class="render"
-    />
+    {#if current.effect === "commands"}
+      <div class="groups">
+        <p class="freestyle-hint">The keys of {configStore.active?.name ?? "this game"}'s commands light in their group's colour.</p>
+        {#each commandGroups as g (g.tag)}
+          {@const chosen = commandColors[g.tag]}
+          <div class="group">
+            <button
+              class="dot"
+              class:none={chosen === ""}
+              style="background: {chosen === '' ? 'transparent' : (chosen ?? g.hex)}"
+              title="Use the colour on the wheel"
+              aria-label="Colour {g.tag}"
+              onclick={() => colourGroup(g.tag)}
+            ></button>
+            {g.tag}<small>{g.count} commands</small>
+            <button class="link" onclick={() => colourGroup(g.tag, true)}>No colour</button>
+          </div>
+        {/each}
+        <p class="freestyle-hint">Pick a colour on the wheel, then click a group's dot to use it.</p>
+      </div>
+    {:else if current.effect === "animation" && keyMap}
+      <div class="freestyle">
+        <KeyboardMap keys={keyMap.keys} size={keyMap.size} fill={frameFill} onpick={paintFrame} />
+        <div class="frames">
+          {#each animation.frames as f, i (i)}
+            <button class="frame" class:active={i === frameIndex} onclick={() => (frameIndex = i)}>
+              {i + 1}<small>{f.durationMs} ms</small>
+            </button>
+          {/each}
+          <button class="frame add" onclick={addFrame} title="Add a copy of this frame">+</button>
+        </div>
+        <p class="freestyle-hint">Paint the selected frame. The keyboard plays the animation as you edit it.</p>
+      </div>
+    {:else if current.effect === "freestyle" && keyMap}
+      <!-- G HUB's Freestyle: pick a colour, click keys or drag a box over them. -->
+      <div class="freestyle">
+        <KeyboardMap keys={keyMap.keys} size={keyMap.size} fill={perKeyFill} onpick={paint} />
+        <p class="freestyle-hint">Click a key or drag over several to paint them. Black turns keys off.</p>
+      </div>
+    {:else}
+      <DeviceArt
+        kind={device.kind}
+        productIds={artworkIds(device)}
+        zones={glows}
+        zoneProductIds={artworkIds(device)}
+        zoneOverrides={positions}
+        {editZones}
+        onzonemove={moveZone}
+        class="render"
+      />
+    {/if}
   {/snippet}
 
   {#snippet stageFooter()}
-    <button class="stage-button" onclick={syncOptions} disabled={syncingOptions}>
-      {syncingOptions ? "Syncing…" : "Sync lighting options"}
-    </button>
+    {#if current.effect === "animation" && keyMap}
+      <button class="stage-button" onclick={deleteFrame} disabled={animation.frames.length <= 1}>Delete frame</button>
+      <button class="stage-button" onclick={() => preset("scanner")}>Preset: scanner</button>
+      <button class="stage-button" onclick={() => preset("rows")}>Preset: rainbow rows</button>
+    {:else if current.effect === "freestyle" && keyMap}
+      <button class="stage-button" onclick={() => paintAll(true)}>Fill all</button>
+      <button class="stage-button" onclick={() => paintAll(false)}>Clear all</button>
+    {:else}
+      <button class="stage-button" onclick={syncOptions} disabled={syncingOptions}>
+        {syncingOptions ? "Syncing…" : "Sync lighting options"}
+      </button>
+    {/if}
   {/snippet}
 </DeviceWorkspace>
 
 <style>
+  .freestyle {
+    width: min(100%, 980px);
+    margin: auto;
+    padding: 0 20px;
+  }
+
+  .groups {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: auto;
+  }
+
+  .group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .group small {
+    color: var(--text-dimmer);
+    font-weight: 500;
+  }
+
+  .dot {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+  }
+
+  .dot.none {
+    border-style: dashed;
+  }
+
+  .link {
+    font-size: 11px;
+    color: var(--text-dimmer);
+    text-decoration: underline;
+  }
+
+  .frames {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 14px;
+  }
+
+  .frame {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 46px;
+    padding: 5px 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .frame small {
+    font-size: 9px;
+    font-weight: 500;
+    color: var(--text-dimmer);
+  }
+
+  .frame.active {
+    border-color: var(--primary, #1196ff);
+    color: var(--primary, #1196ff);
+  }
+
+  .frame.add {
+    justify-content: center;
+    font-size: 16px;
+  }
+
+  .freestyle-hint {
+    margin-top: 14px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-dimmer);
+  }
+
   .zone-tabs {
     display: flex;
     gap: 22px;

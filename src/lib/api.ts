@@ -6,6 +6,7 @@
  * `mock.ts` — that keeps the UI workable without hardware or a Rust build.
  */
 import type {
+  OnboardSlot,
   BatteryEvent,
   Config,
   Device,
@@ -119,6 +120,24 @@ export const setPollingRate = (deviceId: string, rateHz: number) =>
 
 export const setDeviceLighting = (request: LightingRequest) =>
   call<void>("set_device_lighting", { request });
+
+/** Freestyle: individual key colours by LED id. */
+export const setPerKeyLighting = (deviceId: string, keys: { led: number; color: string }[]) =>
+  call<void>("set_per_key_lighting", { deviceId, keys });
+
+export const reapplyLighting = () => call<void>("reapply_lighting");
+
+export const getOnboardSlots = (deviceId: string) => call<OnboardSlot[]>("get_onboard_slots", { deviceId });
+export const setOnboardSlotEnabled = (deviceId: string, index: number, enabled: boolean) =>
+  call<OnboardSlot[]>("set_onboard_slot_enabled", { deviceId, index, enabled });
+export const writeProfileToSlot = (deviceId: string, index: number, profileId: string) =>
+  call<OnboardSlot[]>("write_profile_to_slot", { deviceId, index, profileId });
+
+export const setProfileLock = (deviceId: string, feature: string, locked: boolean) =>
+  call<Config>("set_profile_lock", { deviceId, feature, locked });
+
+export const setGameMode = (deviceId: string, on: boolean) =>
+  call<Config>("set_game_mode", { deviceId, on });
 
 export const getLightingZones = (deviceId: string) =>
   call<ZoneInfo[]>("get_lighting_zones", { deviceId });

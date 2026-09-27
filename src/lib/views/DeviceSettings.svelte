@@ -7,7 +7,7 @@
   import { configStore } from "$lib/stores/config.svelte";
   import { deviceStore } from "$lib/stores/devices.svelte";
   import { ui } from "$lib/stores/ui.svelte";
-  import type { Device, DeviceSettings, FeatureInfo, FirmwareCheck, FirmwareProgress, WheelSettings } from "$lib/types";
+  import type { Device, DeviceSettings, FeatureInfo, FirmwareCheck, FirmwareProgress, OnboardSlot, WheelSettings } from "$lib/types";
 
   interface Props {
     device: Device;
@@ -20,6 +20,28 @@
   let refreshing = $state(false);
 
   const hex = (n: number) => `0x${n.toString(16).padStart(4, "0")}`;
+
+  // -- On-board memory slots (G HUB's ON-BOARD MEMORY SLOTS) -------------------------
+
+  let slots = $state<OnboardSlot[]>([]);
+  let slotBusy = $state(false);
+  let slotProfile = $state<Record<number, string>>({});
+  $effect(() => {
+    if (!device.capabilities.onboardMemory) return;
+    api.getOnboardSlots(device.id).then((s) => (slots = s)).catch(() => (slots = []));
+  });
+
+  async function slotAction(run: () => Promise<OnboardSlot[]>, done: string) {
+    slotBusy = true;
+    try {
+      slots = await run();
+      ui.toast(done, "success", 2500);
+    } catch (e) {
+      ui.toast(api.errorMessage(e), "error", 6000);
+    } finally {
+      slotBusy = false;
+    }
+  }
 
   const rateOptions = $derived(
     (device.reportRate?.availableHz ?? []).map((hz) => ({
@@ -427,6 +449,53 @@
         />
         <span>Store the active profile on the device (on-board memory mode)</span>
       </label>
+    </section>
+
+    <section class="card panel">
+      <h2 class="section-title">On-board memory slots</h2>
+      <p class="none">
+        Each slot holds a profile the device can run without OpenGHub. Disabled slots are skipped
+        when cycling profiles{device.kind === "keyboard" ? "; on this keyboard slot 1–3 are M1–M3" : ""}.
+        Writing a profile puts its DPI, lighting and button bindings (not macros) into the slot;
+        the memory is backed up first.
+      </p>
+      {#each slots as slot (slot.index)}
+        <div class="slot">
+          <span class="slot-name">
+            Slot {slot.index + 1}
+            {#if slot.active}<em>active</em>{/if}
+            {#if !slot.enabled}<em class="off">disabled</em>{/if}
+          </span>
+          <button
+            class="mini"
+            disabled={slotBusy}
+            onclick={() =>
+              slotAction(
+                () => api.setOnboardSlotEnabled(device.id, slot.index, !slot.enabled),
+                `Slot ${slot.index + 1} ${slot.enabled ? "disabled" : "enabled"}.`,
+              )}
+          >
+            {slot.enabled ? "Disable" : "Enable"}
+          </button>
+          <select bind:value={slotProfile[slot.index]}>
+            <option value={undefined}>Choose a profile…</option>
+            {#each configStore.profiles as p (p.id)}
+              <option value={p.id}>{p.name}</option>
+            {/each}
+          </select>
+          <button
+            class="mini"
+            disabled={slotBusy || !slotProfile[slot.index]}
+            onclick={() =>
+              slotAction(
+                () => api.writeProfileToSlot(device.id, slot.index, slotProfile[slot.index]),
+                `Profile written to slot ${slot.index + 1}.`,
+              )}
+          >
+            Write
+          </button>
+        </div>
+      {/each}
     </section>
   {/if}
 
@@ -950,4 +1019,38 @@
       grid-column: span 1;
     }
   }
+  .slot {
+    display: grid;
+    grid-template-columns: 1fr auto 1.4fr auto;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .slot-name {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .slot-name em {
+    margin-left: 6px;
+    font-style: normal;
+    font-size: 11px;
+    color: var(--primary, #1196ff);
+  }
+
+  .slot-name em.off {
+    color: var(--text-dimmer);
+  }
+
+  .mini {
+    height: 28px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
 </style>

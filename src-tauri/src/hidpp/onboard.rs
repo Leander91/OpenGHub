@@ -363,7 +363,7 @@ pub fn write_sector(h: &mut Handle, sector: u16, data: &[u8]) -> Result<()> {
 ///
 /// Opcodes are variable length, so a macro is a byte stream terminated by
 /// [`OP_END`] rather than a fixed-size table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "step")]
 pub enum MacroStep {
     /// HID keyboard usage code, e.g. 0x04 = 'a'.
@@ -377,6 +377,21 @@ pub enum MacroStep {
     MouseUp { mask: u16 },
     /// Pause in milliseconds.
     Delay { ms: u16 },
+    /// Software only (G HUB's TEXT, LAUNCH APPLICATION and SYSTEM entries).
+    /// A macro containing any of these never goes to onboard memory.
+    Text { text: String },
+    /// A command line, run detached.
+    Launch { command: String },
+    /// A key name or chord as `keymap::parse_chord` reads it, e.g.
+    /// `XF86AudioMute`, pressed and released.
+    System { value: String },
+}
+
+impl MacroStep {
+    /// Whether the device can store and play this step itself.
+    pub fn is_onboard(&self) -> bool {
+        !matches!(self, MacroStep::Text { .. } | MacroStep::Launch { .. } | MacroStep::System { .. })
+    }
 }
 
 pub const OP_NOOP: u8 = 0x00;
@@ -390,8 +405,11 @@ pub const OP_DELAY: u8 = 0x80;
 pub const OP_END: u8 = 0xff;
 
 impl MacroStep {
-    pub fn encode(self, out: &mut Vec<u8>) {
-        match self {
+    /// Appends the step's opcode. Software-only steps have none and are
+    /// skipped; `remap::action_for` keeps such macros off the device.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match *self {
+            MacroStep::Text { .. } | MacroStep::Launch { .. } | MacroStep::System { .. } => {}
             MacroStep::KeyDown { usage } => out.extend_from_slice(&[OP_KEY_DOWN, usage]),
             MacroStep::KeyUp { usage } => out.extend_from_slice(&[OP_KEY_UP, usage]),
             MacroStep::ModifiersDown { mask } => out.extend_from_slice(&[OP_MOD_DOWN, mask]),

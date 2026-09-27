@@ -366,6 +366,9 @@ pub struct LightingRequest {
     /// Write to the device's flash as well as RAM, so it survives a replug.
     #[serde(default = "default_persist")]
     pub persist: bool,
+    /// Colour wave direction code; 1 = horizontal.
+    #[serde(default)]
+    pub direction: Option<u8>,
 }
 
 fn all_zones() -> u8 {
@@ -401,6 +404,12 @@ pub async fn set_device_lighting(
             rate_ms: request.rate_ms,
             brightness: request.brightness,
         },
+        "wave" => LightEffect::Wave {
+            rate_ms: request.rate_ms,
+            brightness: request.brightness,
+            direction: request.direction.unwrap_or(1),
+        },
+        "ripple" => LightEffect::Ripple { rate_ms: request.rate_ms },
         other => return Err(Error::other(format!("unknown lighting effect '{other}'"))),
     };
     // 0x8071 devices take live RGB writes even in onboard mode, so they never
@@ -461,6 +470,48 @@ pub async fn set_onboard_mode(
     emit_device_update(&app, &manager, &device_id);
     let _ = app.emit(EVENT_CONFIG_CHANGED, store.get());
     manager.snapshot(&device_id).ok_or(Error::NotConnected)
+}
+
+/// One Freestyle key: the device's LED id and its colour.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerKeyColour {
+    pub led: u8,
+    pub color: String,
+}
+
+/// Freestyle: sets individual key colours (RAM only; the profile keeps them
+/// and they are re-applied on start and profile switch).
+#[tauri::command]
+pub async fn set_per_key_lighting(
+    manager: State<'_, DeviceManager>,
+    device_id: String,
+    keys: Vec<PerKeyColour>,
+) -> Result<()> {
+    let leds: Vec<(u8, [u8; 3])> =
+        keys.iter().map(|k| Ok((k.led, parse_hex_color(&k.color)?))).collect::<Result<_>>()?;
+    manager.set_per_key(&device_id, &leds)
+}
+
+/// Switches Game Mode on or off for a keyboard, with the active profile's
+/// key list.
+#[tauri::command]
+pub async fn set_game_mode(
+    app: AppHandle,
+    store: State<'_, Store>,
+    device_id: String,
+    on: bool,
+) -> Result<Config> {
+    let id = device_id.clone();
+    store.update(move |cfg| {
+        cfg.settings.game_mode_devices.retain(|d| *d != id);
+        if on {
+            cfg.settings.game_mode_devices.push(id);
+        }
+    })?;
+    crate::apply_game_modes(&app);
+    let _ = app.emit(EVENT_CONFIG_CHANGED, store.get());
+    Ok(store.get())
 }
 
 /// Every lighting zone: index, location name and the effects it accepts.
@@ -575,6 +626,12 @@ pub async fn create_profile(
             devices: Default::default(),
             script: None,
         });
+        // A new profile starts with every locked feature already in place.
+        let previous = cfg.active_profile.clone();
+        let locked: Vec<String> = cfg.settings.locks.keys().cloned().collect();
+        for device in locked {
+            cfg.propagate_locks(&device, &previous);
+        }
         cfg.active_profile = id.clone();
     })?;
     Ok(store.get())
@@ -627,6 +684,12 @@ pub async fn duplicate_profile(app: AppHandle, store: State<'_, Store>, profile_
             devices: src.devices.clone(),
             script: src.script.clone(),
         });
+        // A new profile starts with every locked feature already in place.
+        let previous = cfg.active_profile.clone();
+        let locked: Vec<String> = cfg.settings.locks.keys().cloned().collect();
+        for device in locked {
+            cfg.propagate_locks(&device, &previous);
+        }
         cfg.active_profile = id.clone();
         if let Some(app_id) = &src.application_id {
             cfg.settings.active_profile_per_app.insert(app_id.clone(), id.clone());
@@ -660,8 +723,108 @@ pub async fn save_device_profile(
     store.update(|cfg| {
         let active = cfg.active_profile.clone();
         if let Some(p) = cfg.profiles.iter_mut().find(|p| p.id == active) {
-            p.devices.insert(device_id, profile);
+            p.devices.insert(device_id.clone(), profile);
         }
+        // Locked features are the same in every profile.
+        cfg.propagate_locks(&device_id, &active);
+    })?;
+    Ok(store.get())
+}
+
+/// G HUB's ON-BOARD MEMORY SLOTS.
+#[tauri::command]
+pub async fn get_onboard_slots(manager: State<'_, DeviceManager>, device_id: String) -> Result<Vec<crate::state::OnboardSlot>> {
+    manager.onboard_slots(&device_id)
+}
+
+#[tauri::command]
+pub async fn set_onboard_slot_enabled(
+    manager: State<'_, DeviceManager>,
+    device_id: String,
+    index: u8,
+    enabled: bool,
+) -> Result<Vec<crate::state::OnboardSlot>> {
+    manager.set_onboard_slot_enabled(&device_id, index, enabled)?;
+    manager.onboard_slots(&device_id)
+}
+
+/// Writes one of OpenGHub's profiles into an on-board slot: its DPI, its
+/// firmware lighting and its plain button bindings. On a keyboard with M-keys
+/// slot N takes the MN set of G-key bindings, since the keys pick slots.
+#[tauri::command]
+pub async fn write_profile_to_slot(
+    manager: State<'_, DeviceManager>,
+    store: State<'_, Store>,
+    device_id: String,
+    index: u8,
+    profile_id: String,
+) -> Result<Vec<crate::state::OnboardSlot>> {
+    let cfg = store.get();
+    let dp = cfg
+        .profiles
+        .iter()
+        .find(|p| p.id == profile_id)
+        .and_then(|p| p.devices.get(&device_id))
+        .cloned()
+        .unwrap_or_default();
+    let dpi = (!dp.dpi_stages.is_empty()).then(|| {
+        let active = dp.active_stage.min(4) as u8;
+        (dp.dpi_stages.clone(), active, dp.shift_stage.map(|s| s.min(4) as u8).unwrap_or(active), dp.report_rate_hz)
+    });
+    let mut leds = Vec::new();
+    for (zone, l) in &dp.lighting_zones {
+        let Ok(z) = zone.parse::<u8>() else { continue };
+        let fx = match l.effect.as_str() {
+            "off" => LightEffect::Off,
+            "fixed" => LightEffect::Fixed,
+            "breathing" => LightEffect::Breathing { rate_ms: l.rate_ms, brightness: l.brightness },
+            "cycle" => LightEffect::Cycle { rate_ms: l.rate_ms, brightness: l.brightness },
+            _ => continue, // effects the slot's LED table cannot hold
+        };
+        let (id, union) = fx.encode(parse_hex_color(&l.color)?);
+        leds.push((z, id, union));
+    }
+    let keyboard = manager.snapshot(&device_id).map(|s| s.kind == crate::hidpp::registry::DeviceKind::Keyboard).unwrap_or(false);
+    let state = if keyboard && index < 3 { index + 1 } else { 1 };
+    let buttons: Vec<(u8, crate::hidpp::onboard::Button)> = dp
+        .assignments
+        .iter()
+        .filter(|a| crate::remap::m_state(&a.control) == state && !a.control.contains(":gshift"))
+        .filter_map(|a| {
+            let i = crate::remap::button_index(&a.control)?;
+            let b = crate::remap::action_for(a, &dp.macros)?.onboard_button(None)?;
+            Some((i, b))
+        })
+        .collect();
+    manager.write_onboard_slot(&device_id, index, dpi, &leds, &buttons)?;
+    manager.onboard_slots(&device_id)
+}
+
+/// Re-applies the active profile's lighting everywhere (after an animation or
+/// Freestyle change was saved).
+#[tauri::command]
+pub async fn reapply_lighting(app: AppHandle) -> Result<()> {
+    crate::apply_lighting_profiles(&app);
+    Ok(())
+}
+
+/// G HUB's per-profile lock for one feature of one device.
+#[tauri::command]
+pub async fn set_profile_lock(
+    store: State<'_, Store>,
+    device_id: String,
+    feature: String,
+    locked: bool,
+) -> Result<Config> {
+    store.update(|cfg| {
+        let list = cfg.settings.locks.entry(device_id.clone()).or_default();
+        list.retain(|f| *f != feature);
+        if locked {
+            list.push(feature.clone());
+        }
+        // Locking takes the active profile's settings everywhere.
+        let active = cfg.active_profile.clone();
+        cfg.propagate_locks(&device_id, &active);
     })?;
     Ok(store.get())
 }
@@ -695,8 +858,40 @@ pub async fn get_config_path(store: State<'_, Store>) -> Result<String> {
 pub const EVENT_ACTIVE_APPLICATION: &str = "active-application";
 
 #[tauri::command]
-pub async fn get_applications(db: State<'_, std::sync::Arc<crate::apps::AppDatabase>>) -> Result<Vec<crate::apps::Application>> {
-    Ok(db.applications())
+pub async fn get_applications(
+    db: State<'_, std::sync::Arc<crate::apps::AppDatabase>>,
+    library: State<'_, Library>,
+    store: State<'_, Store>,
+) -> Result<Vec<crate::apps::Application>> {
+    let mut apps = db.applications();
+    // Installed games Logitech does not list, so they can be picked too.
+    let games = match library.cached() {
+        Some(g) => g,
+        None => {
+            let manual = store.get().manual_games;
+            let db = db.inner().clone();
+            let g = tauri::async_runtime::spawn_blocking(move || games::scan(&manual, &db))
+                .await
+                .map_err(|e| Error::other(e.to_string()))?;
+            library.set(g.clone());
+            g
+        }
+    };
+    for g in games {
+        let Some(id) = g.application_id else { continue };
+        if apps.iter().any(|a| a.id == id) {
+            continue;
+        }
+        apps.push(crate::apps::Application {
+            steam_app_ids: id.strip_prefix("steam:").map(|s| vec![s.to_string()]).unwrap_or_default(),
+            id,
+            name: g.name,
+            poster_url: g.cover_url,
+            executables: Vec::new(),
+            command_count: 0,
+        });
+    }
+    Ok(apps)
 }
 
 #[tauri::command]

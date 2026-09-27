@@ -40,6 +40,9 @@ libc = "0.2.189"
 ashpd = { version = "0.12.3", features = ["tokio"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "send"] }
+# Text in macros: maps characters to keys for the user's layout. Loaded at
+# run time, so there is no build dependency and no failure without it.
+xkbcommon-dl = "0.4"
 
 # The `probe` example links against the lib and needs hidapi directly.
 [dev-dependencies]

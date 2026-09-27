@@ -668,6 +668,10 @@
 
   .poster {
     position: relative;
+    /* The device render stacks its own glow layers; keep them in here so the
+       card menu always draws on top. */
+    isolation: isolate;
+    z-index: 0;
     width: 100%;
     aspect-ratio: 4 / 5;
     border-radius: 4px;
@@ -716,6 +720,7 @@
 
   .foot {
     position: relative;
+    z-index: 2;
     margin-top: auto;
     display: flex;
     align-items: center;

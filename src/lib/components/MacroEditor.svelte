@@ -10,7 +10,7 @@
    * representation, so they are shown but disabled rather than pretending.
    */
   import Icon, { type IconName } from "$lib/components/Icon.svelte";
-  import { modifierFor, usageFor, MAX_DELAY_MS, type MacroStep } from "$lib/macros";
+  import { modifierFor, usageFor, MAX_DELAY_MS, SYSTEM_COMMANDS, isOnboardStep, type MacroStep } from "$lib/macros";
   import type { MacroDef, MacroKind, MacroSections } from "$lib/types";
 
   interface Props {
@@ -152,49 +152,37 @@
 
   // -- text & delay entries -------------------------------------------------------
 
-  const SHIFTED: Record<string, string> = {
-    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
-    _: "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "~": "`", "<": ",", ">": ".", "?": "/",
-  };
-  const PUNCT: Record<string, string> = {
-    "-": "Minus", "=": "Equal", "[": "BracketLeft", "]": "BracketRight", "\\": "Backslash", ";": "Semicolon",
-    "'": "Quote", "`": "Backquote", ",": "Comma", ".": "Period", "/": "Slash", " ": "Space", "\n": "Enter", "\t": "Tab",
-  };
-
-  /** ASCII text → key presses; anything the device cannot type is skipped. */
-  function stepsForText(text: string): MacroStep[] {
-    const out: MacroStep[] = [];
-    for (const ch of text) {
-      let shift = false;
-      let code: string | null = null;
-      if (/[a-z]/.test(ch)) code = `Key${ch.toUpperCase()}`;
-      else if (/[A-Z]/.test(ch)) {
-        code = `Key${ch}`;
-        shift = true;
-      } else if (/[0-9]/.test(ch)) code = `Digit${ch}`;
-      else if (ch in SHIFTED) {
-        const base = SHIFTED[ch];
-        code = /[0-9]/.test(base) ? `Digit${base}` : PUNCT[base] ?? null;
-        shift = true;
-      } else if (ch in PUNCT) code = PUNCT[ch];
-      if (!code) continue;
-      const usage = usageFor(code);
-      if (usage === null) continue;
-      if (shift) out.push({ step: "modifiersDown", mask: 0x02 });
-      out.push({ step: "keyDown", usage }, { step: "keyUp", usage });
-      if (shift) out.push({ step: "modifiersUp", mask: 0x02 });
-    }
-    return out;
-  }
-
+  /**
+   * Text is typed by OpenGHub with the desktop's keyboard layout, so å, ö,
+   * @ and anything else the layout has come out right. (The device itself
+   * could only replay US key positions.)
+   */
   function addText(section: Section) {
-    const steps = stepsForText(textDraft);
-    if (steps.length) {
-      sections = { ...sections, [section]: [...sections[section], ...steps] };
+    if (textDraft) {
+      sections = { ...sections, [section]: [...sections[section], { step: "text", text: textDraft }] };
       dirty = true;
     }
     textFor = null;
     textDraft = "";
+  }
+
+  let launchFor = $state<Section | null>(null);
+  let launchDraft = $state("");
+  function addLaunch(section: Section) {
+    const command = launchDraft.trim();
+    if (command) {
+      sections = { ...sections, [section]: [...sections[section], { step: "launch", command }] };
+      dirty = true;
+    }
+    launchFor = null;
+    launchDraft = "";
+  }
+
+  let systemFor = $state<Section | null>(null);
+  function addSystem(section: Section, value: string) {
+    sections = { ...sections, [section]: [...sections[section], { step: "system", value }] };
+    dirty = true;
+    systemFor = null;
   }
 
   function addDelay(section: Section) {
@@ -232,6 +220,12 @@
         return `M${Math.log2(s.mask) + 1}`;
       case "delay":
         return `${s.ms} ms`;
+      case "text":
+        return `“${s.text}”`;
+      case "launch":
+        return `▢ ${s.command.split("/").pop()}`;
+      case "system":
+        return SYSTEM_COMMANDS.find((c) => c.value === s.value)?.label.toUpperCase() ?? s.value;
     }
   }
 
@@ -274,6 +268,10 @@
       const s = steps[i];
       if (s.step === "delay") {
         if (!useStandardDelays) out.push({ label: keyLabel(s), dir: "delay", indexes: [i] });
+        continue;
+      }
+      if (!isOnboardStep(s)) {
+        out.push({ label: keyLabel(s), dir: "both", indexes: [i] });
         continue;
       }
       if (!showUpDown && isDown(s)) {
@@ -490,10 +488,10 @@
                     <button class="mi action" disabled title="Runs on the host in G HUB; the device has no onboard equivalent.">
                       <span class="mi-icon">⚡</span> Action
                     </button>
-                    <button class="mi launch" disabled title="Runs on the host in G HUB; the device has no onboard equivalent.">
+                    <button class="mi launch" onclick={() => { menuFor = null; launchFor = sec.id; launchDraft = ""; }}>
                       <span class="mi-icon">▢</span> Launch application
                     </button>
-                    <button class="mi system" disabled title="Runs on the host in G HUB; the device has no onboard equivalent.">
+                    <button class="mi system" onclick={() => { menuFor = null; systemFor = sec.id; }}>
                       <span class="mi-icon">S</span> System
                     </button>
                     <button class="mi delay" onclick={() => { menuFor = null; delayFor = sec.id; delayDraft = 100; }}>
@@ -511,8 +509,25 @@
               <input type="text" placeholder="Type text to be entered" bind:value={textDraft} autofocus spellcheck="false" />
               <button type="submit" class="mini">Add</button>
               <button type="button" class="mini ghost" onclick={() => (textFor = null)}>Cancel</button>
-              <span class="inline-hint">ASCII only — that is what the device can type.</span>
+              <span class="inline-hint">Typed with your keyboard layout. Needs OpenGHub running.</span>
             </form>
+          {/if}
+          {#if launchFor === sec.id}
+            <form class="inline" onsubmit={(e) => { e.preventDefault(); addLaunch(sec.id); }}>
+              <!-- svelte-ignore a11y_autofocus -->
+              <input type="text" placeholder="Command, e.g. firefox or /usr/bin/obs" bind:value={launchDraft} autofocus spellcheck="false" />
+              <button type="submit" class="mini">Add</button>
+              <button type="button" class="mini ghost" onclick={() => (launchFor = null)}>Cancel</button>
+              <span class="inline-hint">Arguments allowed. Needs OpenGHub running.</span>
+            </form>
+          {/if}
+          {#if systemFor === sec.id}
+            <div class="inline">
+              {#each SYSTEM_COMMANDS as c (c.value)}
+                <button type="button" class="mini" onclick={() => addSystem(sec.id, c.value)}>{c.label}</button>
+              {/each}
+              <button type="button" class="mini ghost" onclick={() => (systemFor = null)}>Cancel</button>
+            </div>
           {/if}
           {#if delayFor === sec.id}
             <form class="inline" onsubmit={(e) => { e.preventDefault(); addDelay(sec.id); }}>

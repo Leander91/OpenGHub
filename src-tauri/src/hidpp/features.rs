@@ -187,6 +187,16 @@ pub mod gkeys {
 }
 
 // ---------------------------------------------------------------------------
+// 0x8030 MR (macro record key)
+// ---------------------------------------------------------------------------
+pub mod mr {
+    pub const ID: u16 = 0x8030;
+    /// `[1]` lights the MR LED, `[0]` puts it out. Presses arrive through
+    /// function 0 as `[1]` / `[0]` while the G-keys are in software control.
+    pub const FN_SET_LED: u8 = 0x00;
+}
+
+// ---------------------------------------------------------------------------
 // 0x8020 MKeys
 // ---------------------------------------------------------------------------
 pub mod mkeys {
@@ -194,6 +204,101 @@ pub mod mkeys {
     /// `[led_mask]`, bit 0 = M1. Presses arrive through function 0 as
     /// `[mask]` while the G-keys are in software control.
     pub const FN_SET_LEDS: u8 = 0x01;
+}
+
+// ---------------------------------------------------------------------------
+// 0x4522 DisableKeysByUsage (G HUB's Game Mode)
+// ---------------------------------------------------------------------------
+pub mod disable_keys {
+    pub const ID: u16 = 0x4522;
+    pub const FN_GET_CAPABILITIES: u8 = 0x00;
+    /// `[usage, …]`, HID keyboard usages, up to 16 per call.
+    pub const FN_DISABLE: u8 = 0x01;
+    pub const FN_ENABLE_ALL: u8 = 0x03;
+}
+
+/// Disables exactly `usages` (everything else enabled). Empty re-enables all.
+pub fn set_disabled_keys(h: &mut Handle, usages: &[u8]) -> Result<()> {
+    let idx = h.feature_index(disable_keys::ID)?;
+    h.call(idx, disable_keys::FN_ENABLE_ALL, &[], ReportKind::Long)?;
+    for chunk in usages.chunks(16) {
+        h.call(idx, disable_keys::FN_DISABLE, chunk, ReportKind::Long)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 0x8081 PerKeyLighting
+// ---------------------------------------------------------------------------
+pub mod per_key {
+    pub const ID: u16 = 0x8081;
+    /// Up to four `[led, r, g, b]`, 0xff-terminated when fewer.
+    pub const FN_SET_LEDS: u8 = 0x01;
+    /// `[r, g, b, led × up to 13]`, 0xff-terminated when fewer.
+    pub const FN_SET_LEDS_ONE_COLOUR: u8 = 0x06;
+    /// Shows everything sent since the last commit.
+    pub const FN_COMMIT: u8 = 0x07;
+    pub const LITTLE_MAX: usize = 4;
+    pub const BIG_MAX: usize = 13;
+}
+
+/// Sets individual LEDs, by the device's own LED ids, and shows them.
+///
+/// The keyboard's cluster effects are switched off first so the per-key
+/// colours are what shows; this is the sequence OpenRGB's G915 direct mode
+/// uses. Keys sharing a colour go in one frame, as that is 13 keys a packet.
+pub fn write_per_key(h: &mut Handle, leds: &[(u8, [u8; 3])]) -> Result<()> {
+    write_per_key_frame(h, leds, true)
+}
+
+/// As [`write_per_key`]; `take_over` false skips switching the clusters off,
+/// for the frames of an animation after the first.
+pub fn write_per_key_frame(h: &mut Handle, leds: &[(u8, [u8; 3])], take_over: bool) -> Result<()> {
+    let idx = h.feature_index(per_key::ID)?;
+    // Take the LEDs as for any lighting write, with every cluster off.
+    if take_over && (h.supports(lighting::ID_RGB_EFFECTS) || h.supports(lighting::ID_COLOR_LED_EFFECTS)) {
+        let count = lighting_zone_count(h).unwrap_or(0);
+        for z in 0..count {
+            let _ = write_lighting(h, z, [0, 0, 0], LightEffect::Off, false);
+        }
+    }
+
+    let mut by_colour: Vec<([u8; 3], Vec<u8>)> = Vec::new();
+    for (led, rgb) in leds {
+        match by_colour.iter_mut().find(|(c, _)| c == rgb) {
+            Some((_, list)) => list.push(*led),
+            None => by_colour.push((*rgb, vec![*led])),
+        }
+    }
+    let mut singles: Vec<(u8, [u8; 3])> = Vec::new();
+    for (rgb, list) in &by_colour {
+        for chunk in list.chunks(per_key::BIG_MAX) {
+            if chunk.len() <= per_key::LITTLE_MAX {
+                singles.extend(chunk.iter().map(|l| (*l, *rgb)));
+                continue;
+            }
+            let mut p = Vec::with_capacity(16);
+            p.extend_from_slice(rgb);
+            p.extend_from_slice(chunk);
+            if chunk.len() < per_key::BIG_MAX {
+                p.push(0xff);
+            }
+            h.call(idx, per_key::FN_SET_LEDS_ONE_COLOUR, &p, ReportKind::Long)?;
+        }
+    }
+    for chunk in singles.chunks(per_key::LITTLE_MAX) {
+        let mut p = Vec::with_capacity(16);
+        for (led, rgb) in chunk {
+            p.push(*led);
+            p.extend_from_slice(rgb);
+        }
+        if chunk.len() < per_key::LITTLE_MAX {
+            p.push(0xff);
+        }
+        h.call(idx, per_key::FN_SET_LEDS, &p, ReportKind::Long)?;
+    }
+    h.call(idx, per_key::FN_COMMIT, &[], ReportKind::Long)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +340,10 @@ pub mod lighting {
     pub const EFFECT_FIXED: u8 = 0x01;
     pub const EFFECT_CYCLE: u8 = 0x03;
     pub const EFFECT_BREATHING: u8 = 0x0a;
+    /// Keyboards: a colour wave across the keys (G HUB's COLORWAVE).
+    pub const EFFECT_WAVE: u8 = 0x04;
+    /// Keyboards: colour spreading from each pressed key (G HUB's RIPPLE).
+    pub const EFFECT_RIPPLE: u8 = 0x0b;
 
     /// Passed as the zone index to mean "every zone on the device".
     pub const ALL_ZONES: u8 = 0xff;
@@ -949,6 +1058,10 @@ pub enum LightEffect {
     Breathing { rate_ms: u16, brightness: u8 },
     /// Full spectrum sweep; `rate_ms` is one revolution.
     Cycle { rate_ms: u16, brightness: u8 },
+    /// Colour wave; `direction` is the device's code (1 = horizontal).
+    Wave { rate_ms: u16, brightness: u8, direction: u8 },
+    /// Ripple from each key press in the given colour; `rate_ms` 2-200.
+    Ripple { rate_ms: u16 },
 }
 
 impl LightEffect {
@@ -979,6 +1092,24 @@ impl LightEffect {
                 p[5..7].copy_from_slice(&rate_ms.to_be_bytes());
                 p[7] = brightness;
                 (lighting::EFFECT_CYCLE, p)
+            }
+
+            // wave: { <6 unused>, period_lo, direction, intensity, period_hi }
+            // (OpenRGB's G915 layout).
+            LightEffect::Wave { rate_ms, brightness, direction } => {
+                let [hi, lo] = rate_ms.to_be_bytes();
+                p[6] = lo;
+                p[7] = direction;
+                p[8] = brightness;
+                p[9] = hi;
+                (lighting::EFFECT_WAVE, p)
+            }
+
+            // ripple: { r, g, b, <2 unused>, period_ms }
+            LightEffect::Ripple { rate_ms } => {
+                p[0..3].copy_from_slice(&rgb);
+                p[5] = rate_ms.clamp(2, 255) as u8;
+                (lighting::EFFECT_RIPPLE, p)
             }
         }
     }

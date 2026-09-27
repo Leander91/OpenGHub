@@ -1,5 +1,6 @@
 //! OpenGHub — an open source, Linux-native reimplementation of Logitech G HUB.
 
+pub mod animation;
 pub mod apps;
 pub mod artwork;
 pub mod autostart;
@@ -8,6 +9,7 @@ pub mod community;
 pub mod demo;
 pub mod depot;
 pub mod firmware;
+pub mod gamemode;
 pub mod games;
 pub mod ghub_settings;
 pub mod keymap;
@@ -19,6 +21,8 @@ pub mod scripting;
 pub mod hidpp;
 pub mod profiles;
 pub mod state;
+pub mod recorder;
+pub mod text;
 pub mod uinput;
 pub mod wheel;
 
@@ -49,6 +53,9 @@ pub fn run() {
         .manage(std::sync::Arc::new(apps::AppDatabase::new()))
         .manage(games::Library::default())
         .manage(std::sync::Arc::new(remap::Injector::new()))
+        .manage(recorder::Recorder::default())
+        .manage(animation::Animator::default())
+        .manage(gamemode::GameMode::default())
         .manage(std::sync::Arc::new(lightsync::LightSync::new()))
         .manage(std::sync::Arc::new(scripting::Scripting::new()))
         .setup(|app| {
@@ -92,6 +99,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::frontend_log,
+            commands::set_per_key_lighting,
+            commands::set_game_mode,
+            commands::set_profile_lock,
+            commands::reapply_lighting,
+            commands::get_onboard_slots,
+            commands::set_onboard_slot_enabled,
+            commands::write_profile_to_slot,
             commands::get_connected_devices,
             commands::get_udev_rule_status,
             commands::install_udev_rule,
@@ -174,6 +188,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 app.state::<std::sync::Arc<scripting::Scripting>>().stop();
                 app.state::<std::sync::Arc<lightsync::LightSync>>().stop_all();
+                app.state::<gamemode::GameMode>().disable_all();
                 app.state::<DeviceManager>().release_devices();
                 app.state::<std::sync::Arc<remap::Injector>>().release_all();
             }
@@ -225,6 +240,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 // Give the devices back before going: identity remapping,
                 // spy off, onboard mode, released keys.
                 app.state::<std::sync::Arc<scripting::Scripting>>().stop();
+                app.state::<gamemode::GameMode>().disable_all();
                 app.state::<DeviceManager>().release_devices();
                 app.state::<std::sync::Arc<remap::Injector>>().release_all();
                 app.exit(0)
@@ -371,14 +387,16 @@ fn spawn_application_watcher(app: tauri::AppHandle) {
             Err(e) => log::warn!("application database task failed: {e}"),
         }
 
-        let mut last: Option<String> = None;
+        // `None` until the first check, so a game profile left active from
+        // before (no game running now) is switched back on start as well.
+        let mut last: Option<Option<String>> = None;
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             let current = db.detect_running();
-            if current == last {
+            if last.as_ref() == Some(&current) {
                 continue;
             }
-            last = current.clone();
+            last = Some(current.clone());
             let _ = app.emit(commands::EVENT_ACTIVE_APPLICATION, &current);
 
             // Switch profiles to match, if the user has that on.
@@ -515,6 +533,10 @@ fn spawn_button_pump(app: tauri::AppHandle) {
                 }
                 let scripting = app.state::<std::sync::Arc<scripting::Scripting>>();
                 for ev in events {
+                    // MR recording takes the MR key and the G-key it targets.
+                    if record_edge(&app, &ev) {
+                        continue;
+                    }
                     if !ev.wheel {
                         scripting.mouse_button(ev.button, ev.pressed);
                     }
@@ -531,6 +553,85 @@ fn spawn_button_pump(app: tauri::AppHandle) {
         .expect("button pump thread");
 }
 
+/// Feeds MR and G-key edges to the recorder; true when it used the edge.
+fn record_edge(app: &tauri::AppHandle, ev: &state::ButtonEvent) -> bool {
+    use recorder::Outcome;
+    let manager = app.state::<DeviceManager>();
+    let Some(snap) = manager.snapshot(&ev.device_id) else { return false };
+    if snap.kind != hidpp::registry::DeviceKind::Keyboard || ev.wheel {
+        return false;
+    }
+    // evdev names the keyboard "Logitech G915 …"; the model token finds it.
+    let token = snap.name.split_whitespace().next().unwrap_or(&snap.name).to_string();
+    let rec = app.state::<recorder::Recorder>();
+    let outcome = if ev.button == state::MR_BUTTON {
+        if !ev.pressed {
+            return true;
+        }
+        rec.mr_pressed(&ev.device_id)
+    } else {
+        rec.gkey(&ev.device_id, ev.button, ev.pressed, &token)
+    };
+    match outcome {
+        Outcome::Ignored => ev.button == state::MR_BUTTON,
+        Outcome::Consumed => true,
+        Outcome::Armed => {
+            manager.set_mr_led(&ev.device_id, true);
+            log::info!("{}: MR — press a G-key to record onto", snap.name);
+            true
+        }
+        Outcome::Cancelled => {
+            manager.set_mr_led(&ev.device_id, false);
+            log::info!("{}: MR recording cancelled", snap.name);
+            true
+        }
+        Outcome::Finished { device, button, steps } => {
+            manager.set_mr_led(&device, false);
+            bind_recording(app, &device, button, steps);
+            true
+        }
+    }
+}
+
+/// Saves an MR recording as a macro and binds it to the G-key, in the M-state
+/// the keyboard is in, on the active profile.
+fn bind_recording(app: &tauri::AppHandle, device: &str, button: u8, steps: Vec<hidpp::onboard::MacroStep>) {
+    if steps.is_empty() {
+        log::info!("{device}: MR recording was empty, nothing bound");
+        return;
+    }
+    let manager = app.state::<DeviceManager>();
+    let m = manager.m_state(device);
+    let control = if m > 1 { format!("button-{}:m{m}", button + 1) } else { format!("button-{}", button + 1) };
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let id = format!("m{stamp}");
+    let name = format!("MR G{} (M{m})", button + 1);
+    let Ok(mut def) = serde_json::from_value::<profiles::MacroDef>(serde_json::json!({ "id": id, "name": name, "steps": [] })) else {
+        return;
+    };
+    def.steps = steps;
+    def.kind = Some("noRepeat".into());
+    let store = app.state::<Store>();
+    let dev = device.to_string();
+    let result = store.update(move |cfg| {
+        let active = cfg.active_profile.clone();
+        if let Some(p) = cfg.profiles.iter_mut().find(|p| p.id == active) {
+            let dp = p.devices.entry(dev.clone()).or_default();
+            dp.macros.push(def);
+            dp.assignments.retain(|a| a.control != control);
+            dp.assignments.push(profiles::Assignment { control, category: "macro".into(), label: name, value: id });
+        }
+        cfg.propagate_locks(&dev, &active);
+    });
+    if let Err(e) = result {
+        log::warn!("MR recording not saved: {e}");
+        return;
+    }
+    log::info!("{device}: MR recording bound to G{} (M{m})", button + 1);
+    apply_assignment_profiles(app);
+    let _ = app.emit(commands::EVENT_CONFIG_CHANGED, store.get());
+}
+
 /// Runs one assignment edge. Keys are held for as long as the button is.
 fn perform(app: &tauri::AppHandle, ev: state::ButtonEvent) {
     use remap::Action;
@@ -543,6 +644,10 @@ fn perform(app: &tauri::AppHandle, ev: state::ButtonEvent) {
             if ev.pressed {
                 injector.play_macro(steps.clone());
             }
+            Ok(())
+        }
+        Action::MacroRun(play) => {
+            injector.macro_edge(&format!("{}:{}", ev.device_id, ev.button), play, ev.pressed);
             Ok(())
         }
         Action::LockScreen => {
@@ -561,7 +666,7 @@ fn perform(app: &tauri::AppHandle, ev: state::ButtonEvent) {
             }
             Ok(())
         }
-        Action::GShift | Action::Disabled => Ok(()),
+        Action::GShift | Action::Disabled | Action::MacroRecord => Ok(()),
     };
     if let Err(e) = result {
         log::warn!("assignment on {} button {} failed: {e}", ev.device_id, ev.button + 1);
@@ -650,6 +755,7 @@ fn next_profile(app: &tauri::AppHandle) {
 pub fn apply_all_profiles(app: &tauri::AppHandle) {
     apply_wheel_profiles(app);
     apply_onboard_modes(app);
+    apply_game_modes(app);
     apply_device_settings(app, None);
     apply_assignment_profiles(app);
     apply_lighting_profiles(app);
@@ -657,6 +763,32 @@ pub fn apply_all_profiles(app: &tauri::AppHandle) {
         write_profile_to_device(app, &id);
     }
     apply_profile_script(app);
+}
+
+/// Game Mode on every keyboard that has it: the active profile's keys are
+/// blocked while it is switched on (see `gamemode.rs`).
+pub fn apply_game_modes(app: &tauri::AppHandle) {
+    let manager = app.state::<DeviceManager>();
+    let game_mode = app.state::<gamemode::GameMode>();
+    let cfg = app.state::<Store>().get();
+    let active = cfg.profiles.iter().find(|p| p.id == cfg.active_profile);
+    for snap in manager.snapshots() {
+        if snap.demo || snap.kind != hidpp::registry::DeviceKind::Keyboard {
+            continue;
+        }
+        if !snap.online || !cfg.settings.game_mode_devices.contains(&snap.id) {
+            game_mode.disable(&snap.id);
+            continue;
+        }
+        let usages = active
+            .and_then(|p| p.devices.get(&snap.id))
+            .and_then(|d| d.game_mode_keys.clone())
+            .unwrap_or_else(|| profiles::GAME_MODE_DEFAULT_KEYS.to_vec());
+        // evdev names the keyboard "Logitech G915 …"; the model token finds it.
+        let token = snap.name.split_whitespace().next().unwrap_or(&snap.name).to_string();
+        let injector = app.state::<std::sync::Arc<remap::Injector>>().inner().clone();
+        game_mode.enable(&snap.id, &token, gamemode::codes_for_usages(&usages), injector);
+    }
 }
 
 /// The channel scripts use to reach the device layer.
@@ -852,7 +984,21 @@ pub fn apply_lighting_profiles(app: &tauri::AppHandle) {
         if snap.demo || !(snap.capabilities.lighting || snap.capabilities.wheel) {
             continue;
         }
-        let Some(dp) = active.and_then(|p| p.devices.get(&snap.id)) else { continue };
+        let animator = app.state::<animation::Animator>();
+        let Some(dp) = active.and_then(|p| p.devices.get(&snap.id)) else {
+            animator.stop(&snap.id);
+            continue;
+        };
+        // Keyboard animations are played by OpenGHub, frame by frame.
+        match (&dp.animation, dp.lighting_zones.values().any(|l| l.effect == "animation")) {
+            (Some(anim), true) if snap.online => animator.play(app.clone(), &snap.id, anim.clone()),
+            _ => animator.stop(&snap.id),
+        }
+        // Each profile carries its own lighting, as in G HUB: firmware effects
+        // and Freestyle are written here, software effects run below.
+        if snap.online && snap.capabilities.lighting && !dp.lighting_zones.is_empty() {
+            write_profile_lighting(app, &snap.id, None);
+        }
         for (zone, settings) in &dp.lighting_zones {
             if let (Ok(z), Some(fx)) = (zone.parse::<u8>(), settings.software.clone()) {
                 if settings.effect == "screen" || settings.effect == "audio" {
@@ -888,6 +1034,37 @@ fn low_battery_check(app: &tauri::AppHandle, device_id: &str, percentage: u8, di
     }
 }
 
+/// Per-key colours for a game's commands: every key of a command's keystroke
+/// in its group's colour. LED ids follow the per-key scheme of the G915 and
+/// G815 (usage - 3, modifiers usage - 0x78).
+fn command_leds(commands: &apps::ApplicationCommands, overrides: &std::collections::HashMap<String, String>) -> Vec<(u8, [u8; 3])> {
+    let colour_of = |tag: &str| match overrides.get(tag) {
+        Some(hex) if hex.is_empty() => None, // NO COLOR
+        Some(hex) => Some(crate::lightsync::parse_hex(hex)),
+        None => commands.category_colors.iter().find(|c| c.tag == tag).map(|c| crate::lightsync::parse_hex(&c.hex)),
+    };
+    let mut out: Vec<(u8, [u8; 3])> = Vec::new();
+    for cmd in &commands.commands {
+        let Some(rgb) = colour_of(&cmd.category) else { continue };
+        for name in &cmd.keystroke {
+            let Some(chord) = keymap::parse_chord(name) else { continue };
+            for code in chord.codes {
+                let led = if let Some(bit) = keymap::modifier_bit_for_code(code) {
+                    Some(0xe0 + bit.trailing_zeros() as u8 - 0x78)
+                } else {
+                    keymap::usage_for_code(code).map(|u| u - 3)
+                };
+                if let Some(led) = led {
+                    if !out.iter().any(|(l, _)| *l == led) {
+                        out.push((led, rgb));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Re-applies the active profile's lighting to a device, optionally with the
 /// brightness capped (low-battery mode). RAM only.
 fn write_profile_lighting(app: &tauri::AppHandle, device_id: &str, cap: Option<u8>) {
@@ -897,6 +1074,43 @@ fn write_profile_lighting(app: &tauri::AppHandle, device_id: &str, cap: Option<u
     let Some(dp) = cfg.profiles.iter().find(|p| p.id == cfg.active_profile).and_then(|p| p.devices.get(device_id)) else {
         return;
     };
+    // The animator owns the keys while an animation runs.
+    if dp.lighting_zones.values().any(|l| l.effect == "animation") {
+        return;
+    }
+    // G HUB's Command Lighting: the game's command keys in their group colours.
+    if dp.lighting_zones.values().any(|l| l.effect == "commands") {
+        let profile = cfg.profiles.iter().find(|p| p.id == cfg.active_profile);
+        let db = app.state::<std::sync::Arc<apps::AppDatabase>>();
+        let leds = profile
+            .and_then(|p| p.application_id.as_deref())
+            .and_then(|id| db.commands(id))
+            .map(|c| command_leds(&c, &dp.command_colors))
+            .unwrap_or_default();
+        if let Err(e) = manager.set_per_key(device_id, &leds) {
+            log::debug!("{device_id}: command lighting not written: {e}");
+        }
+        return;
+    }
+    // Freestyle is the whole keyboard at once, not one zone.
+    if dp.lighting_zones.values().any(|l| l.effect == "freestyle") {
+        let scale = cap.unwrap_or(100) as u32;
+        let leds: Vec<(u8, [u8; 3])> = dp
+            .per_key
+            .iter()
+            .filter_map(|(led, hex)| {
+                let mut rgb = crate::lightsync::parse_hex(hex);
+                for c in rgb.iter_mut() {
+                    *c = (*c as u32 * scale / 100) as u8;
+                }
+                Some((led.parse().ok()?, rgb))
+            })
+            .collect();
+        if let Err(e) = manager.set_per_key(device_id, &leds) {
+            log::debug!("{device_id}: freestyle not written: {e}");
+        }
+        return;
+    }
     for (zone, l) in &dp.lighting_zones {
         let Ok(z) = zone.parse::<u8>() else { continue };
         let brightness = cap.map(|c| c.min(l.brightness)).unwrap_or(l.brightness);
@@ -905,6 +1119,8 @@ fn write_profile_lighting(app: &tauri::AppHandle, device_id: &str, cap: Option<u
             "off" => hidpp::features::LightEffect::Off,
             "breathing" => hidpp::features::LightEffect::Breathing { rate_ms: l.rate_ms, brightness },
             "cycle" => hidpp::features::LightEffect::Cycle { rate_ms: l.rate_ms, brightness },
+            "wave" => hidpp::features::LightEffect::Wave { rate_ms: l.rate_ms, brightness, direction: l.direction.unwrap_or(1) },
+            "ripple" => hidpp::features::LightEffect::Ripple { rate_ms: l.rate_ms },
             _ => {
                 // Fixed (and software effects): scale the colour itself.
                 for c in rgb.iter_mut() {

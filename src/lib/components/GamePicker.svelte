@@ -19,11 +19,17 @@
   let { value, onselect, onclose }: Props = $props();
 
   let apps = $state<Application[]>([]);
+  /** Application ids of the games installed on this machine. */
+  let installed = $state<Set<string>>(new Set());
   let search = $state("");
   let loading = $state(true);
   let error = $state<string | null>(null);
 
   onMount(async () => {
+    api
+      .getGames(false)
+      .then((games) => (installed = new Set(games.flatMap((g) => (g.applicationId ? [g.applicationId] : [])))))
+      .catch(() => {});
     try {
       // Keyed lists must have unique ids; the backend dedupes, but a stale
       // cache from an older build should not be able to break the picker.
@@ -36,10 +42,16 @@
     }
   });
 
+  /** "WAR THUNDER", "War-Thunder" and "warthunder" all match "war thunder". */
+  const fold = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+
+  /** Installed games first — those are what a profile is usually for. */
   const filtered = $derived.by(() => {
-    const q = search.trim().toLowerCase();
-    const list = q ? apps.filter((a) => a.name.toLowerCase().includes(q)) : apps;
-    return list.slice(0, 60);
+    const q = fold(search);
+    const list = q ? apps.filter((a) => fold(a.name).includes(q)) : apps;
+    return [...list]
+      .sort((a, b) => Number(installed.has(b.id)) - Number(installed.has(a.id)))
+      .slice(0, 60);
   });
 
   async function refresh() {
@@ -89,7 +101,9 @@
             <span class="poster blank"><Icon name="macro" size={22} /></span>
           {/if}
           <span class="name">{app.name}</span>
-          {#if app.steamAppIds.length}
+          {#if installed.has(app.id)}
+            <span class="tag">Installed</span>
+          {:else if app.steamAppIds.length}
             <span class="tag">Steam</span>
           {/if}
         </button>

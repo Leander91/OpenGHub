@@ -5,6 +5,7 @@ use openghub_lib::state::DeviceManager;
 fn main() {
     let m = DeviceManager::new();
     for d in m.refresh() {
+        println!("   model_ids={:04x?}", d.model_ids);
         println!("== {} ({:04x}) id={} kind={:?} conn={:?} onboard_mode={:?} zones={}",
             d.name, d.product_id, d.id, d.kind, d.connection, d.onboard_mode, d.lighting_zones);
         match m.enumerate_features(&d.id) {

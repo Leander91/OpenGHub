@@ -330,12 +330,25 @@ impl AppDatabase {
             };
             let base = PathBuf::from("/proc").join(pid);
 
+            // Launchers and runtime helpers carry the game's SteamAppId too,
+            // and some (Gaijin's launcher for War Thunder) stay open after the
+            // game quits; they must not keep the game's profile active.
+            let comm = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
+            if is_helper_process(comm.trim()) {
+                continue;
+            }
+
             if let Ok(environ) = std::fs::read(base.join("environ")) {
                 for var in environ.split(|b| *b == 0) {
                     if let Some(id) = var.strip_prefix(b"SteamAppId=") {
                         if let Ok(id) = std::str::from_utf8(id) {
                             if let Some(app) = l.by_steam_id.get(id) {
                                 return Some(app.clone());
+                            }
+                            // An installed game Logitech does not list: its
+                            // id is the one `games::scan` gave it.
+                            if !id.is_empty() && id != "0" && id.chars().all(|c| c.is_ascii_digit()) {
+                                return Some(format!("steam:{id}"));
                             }
                         }
                     }
@@ -360,6 +373,20 @@ impl AppDatabase {
     }
 }
 
+/// Processes that run alongside a game without being it: launchers, Steam's
+/// runtime and reaper, and the Wine/Proton services every Windows game has.
+fn is_helper_process(comm: &str) -> bool {
+    let c = comm.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "launcher", "launcher.exe", "reaper", "steam", "steamwebhelper", "srt-bwrap", "bwrap", "wineserver",
+        "services.exe", "winedevice.exe", "plugplay.exe", "svchost.exe", "rpcss.exe", "explorer.exe",
+        "tabtip.exe", "conhost.exe", "start.exe", "wine", "wine64", "wine-preloader", "wine64-preloader",
+        "python3", "python", "sh", "bash", "timeout",
+    ];
+    const PREFIX: &[&str] = &["pressure-vessel", "steam-runtime", "gaijin", "proton", "crashpad", "bugreport"];
+    EXACT.contains(&c.as_str()) || PREFIX.iter().any(|p| c.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +403,15 @@ mod tests {
        "detection":[{"glob":"%LOCALAPPDATA%\\\\Ubisoft\\\\r6*\\\\RainbowSix.exe"}],
        "commands":[]}
     ]}"##;
+
+    #[test]
+    fn launchers_do_not_count_as_the_game() {
+        assert!(is_helper_process("launcher"));
+        assert!(is_helper_process("pressure-vessel-wrap"));
+        assert!(is_helper_process("gaijin_downloader"));
+        assert!(!is_helper_process("aces"));
+        assert!(!is_helper_process("valheim.x86_64"));
+    }
 
     #[test]
     fn parses_the_public_database_shape() {
