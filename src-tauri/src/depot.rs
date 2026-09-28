@@ -136,6 +136,12 @@ impl Depository {
     pub fn depot(&self, name: &str) -> Option<&DepotEntry> {
         self.depots.iter().find(|d| d.name == name)
     }
+
+    /// A device's depot by name or, for newer builds, by prefix.
+    pub fn depot_for(&self, depot: &str) -> Option<&DepotEntry> {
+        let name = resolve_depot_name(self.depots.iter().map(|d| d.name.as_str()), depot)?;
+        self.depot(&name)
+    }
 }
 
 fn string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -233,7 +239,14 @@ pub fn parse_device_file(bytes: &[u8]) -> Vec<DeviceDef> {
             Some(DeviceDef {
                 model_id,
                 display_name: d.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                depot: d.get("depot").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                // Newer G HUB builds (869589) give a `depotPrefix` instead,
+                // with one depot per keyboard layout (`g213_nordic`, `g213_us`).
+                depot: d
+                    .get("depot")
+                    .or_else(|| d.get("depotPrefix"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 slot_prefix: d.get("slotPrefix").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 kind: d.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 thumbnail: d.get("thumbnail").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -738,6 +751,34 @@ pub fn import_device_files(
     })
 }
 
+/// Picks a device's depot among `names`: the exact name, or else — for a
+/// newer build's `depotPrefix` — `<prefix>_<layout>`, preferring the desktop
+/// keyboard layout's family (`nordic` for se/fi/no/dk), then `us`. Firmware
+/// update depots (`_dfu`) are never a device's artwork.
+pub fn resolve_depot_name<'a>(names: impl Iterator<Item = &'a str> + Clone, depot: &str) -> Option<String> {
+    resolve_depot_name_for(names, depot, &crate::text::layout_name())
+}
+
+fn resolve_depot_name_for<'a>(names: impl Iterator<Item = &'a str> + Clone, depot: &str, layout: &str) -> Option<String> {
+    if depot.is_empty() {
+        return None;
+    }
+    if let Some(n) = names.clone().find(|n| *n == depot) {
+        return Some(n.to_string());
+    }
+    let prefix = format!("{depot}_");
+    let variants: Vec<&str> = names.filter(|n| n.starts_with(&prefix) && !n.ends_with("_dfu")).collect();
+    let family = match layout {
+        "se" | "fi" | "no" | "dk" => "nordic",
+        other => other,
+    };
+    [family, "us"]
+        .iter()
+        .find_map(|want| variants.iter().find(|v| v[prefix.len()..] == **want))
+        .or_else(|| variants.first())
+        .map(|v| v.to_string())
+}
+
 /// Reads a whole `C:\ProgramData\LGHUB` tree: caches the depository and the
 /// device database, then imports every device depot already present on disk.
 pub fn import_program_data(root: &Path) -> Result<ImportReport, Error> {
@@ -776,7 +817,17 @@ pub fn import_program_data(root: &Path) -> Result<ImportReport, Error> {
         if def.depot.is_empty() || def.product_ids.is_empty() {
             continue;
         }
-        let depot_dir = build_dir.join(&def.depot);
+        let on_disk: Vec<String> = std::fs::read_dir(&build_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let Some(name) = resolve_depot_name(on_disk.iter().map(String::as_str), &def.depot) else {
+            continue;
+        };
+        let depot_dir = build_dir.join(name);
         if !depot_dir.is_dir() {
             continue; // not downloaded by G HUB on that machine
         }
@@ -854,7 +905,7 @@ pub fn fetch_for_product_ids(product_ids: &[u16]) -> Result<ImportedDevice, Erro
             ))
         })?;
     let entry = depository
-        .depot(&def.depot)
+        .depot_for(&def.depot)
         .ok_or_else(|| Error::other(format!("depot '{}' is not in the depository", def.depot)))?;
 
     log::info!("fetching depot {} ({} bytes) for {}", def.depot, entry.size, def.display_name);
@@ -897,6 +948,16 @@ fn fetch_thumbnail(depository: &Depository, uri: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depot_prefixes_pick_the_layout_variant() {
+        let names = ["core", "g213_nordic", "g213_us", "g213_dfu", "g502_wireless"];
+        let r = |d: &str, l: &str| resolve_depot_name_for(names.iter().copied(), d, l);
+        assert_eq!(r("g502_wireless", "se").as_deref(), Some("g502_wireless"));
+        assert_eq!(r("g213", "se").as_deref(), Some("g213_nordic"));
+        assert_eq!(r("g213", "de").as_deref(), Some("g213_us"));
+        assert_eq!(r("g915", "se"), None);
+    }
 
     #[test]
     fn depot_round_trips() {
