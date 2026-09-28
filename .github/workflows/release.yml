@@ -85,7 +85,7 @@ jobs:
             - Debian / Ubuntu / Mint / Pop!_OS: `sudo apt install ./OpenGHub_*_amd64.deb`
             - Fedora / openSUSE / RHEL: `sudo dnf install ./OpenGHub-*.rpm`
             - Arch / Manjaro / EndeavourOS: `makepkg -si` with the attached PKGBUILD (AUR: `openghub-bin`)
-            - Flatpak: `flatpak install --user OpenGHub_*.flatpak` (needs the GNOME 47 runtime from Flathub)
+            - Flatpak: `flatpak install --user OpenGHub_*.flatpak` (needs the GNOME 50 runtime from Flathub)
             - Anything else: `chmod +x OpenGHub_*.AppImage && ./OpenGHub_*.AppImage`
 
             The .deb and .rpm install the udev rule; the AppImage offers to install it on first launch.
@@ -123,43 +123,45 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "v${{ steps.meta.outputs.version }}" dist/PKGBUILD dist/openghub-bin.install --clobber
 
+  # Built in Flathub's own container: the flatpak-builder from Ubuntu's apt is
+  # too old for current runtimes (it still calls appstream-compose, which they
+  # no longer ship). The container has no gh, so uploading is its own job.
   flatpak:
     name: Flatpak bundle
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Version from the tag
         id: meta
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: flatpak-builder and the GNOME runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
-          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y --noninteractive flathub org.gnome.Platform//47 org.gnome.Sdk//47
-
       - name: The release .deb
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           v="${{ steps.meta.outputs.version }}"
-          gh release download "v$v" --pattern "OpenGHub_*_amd64.deb" --dir packaging/flatpak
+          curl -fsSL -o "packaging/flatpak/OpenGHub_${v}_amd64.deb" \
+            "https://github.com/${{ github.repository }}/releases/download/v$v/OpenGHub_${v}_amd64.deb"
           sed -i "s/OpenGHub_0.1.0_amd64.deb/OpenGHub_${v}_amd64.deb/" packaging/flatpak/io.github.slyvan25.OpenGHub.yml
-          sed -i "s/version=\"0.1.0\" date=\"[0-9-]*\"/version=\"${v}\" date=\"$(date +%F)\"/" packaging/flatpak/io.github.slyvan25.OpenGHub.metainfo.xml
+          # Newest release first; a version already listed keeps its entry.
+          m=packaging/flatpak/io.github.slyvan25.OpenGHub.metainfo.xml
+          grep -q "version=\"${v}\"" "$m" || \
+            sed -i "s|<releases>|<releases>\n    <release version=\"${v}\" date=\"$(date +%F)\"/>|" "$m"
 
       - name: Build and bundle
-        run: |
-          v="${{ steps.meta.outputs.version }}"
-          flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/io.github.slyvan25.OpenGHub.yml
-          flatpak build-bundle repo "OpenGHub_${v}.flatpak" io.github.slyvan25.OpenGHub
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: packaging/flatpak/io.github.slyvan25.OpenGHub.yml
+          bundle: OpenGHub_${{ steps.meta.outputs.version }}.flatpak
+          cache-key: flatpak-builder-${{ github.sha }}
 
       - name: The manifest to submit to Flathub
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           v="${{ steps.meta.outputs.version }}"
           mkdir -p flathub
@@ -168,9 +170,25 @@ jobs:
           cp packaging/flatpak/io.github.slyvan25.OpenGHub.metainfo.xml flathub/
           tar -czf "flathub-manifest-${v}.tar.gz" -C flathub .
 
-      - name: Attach the bundle and the Flathub manifest
-        env:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-release
+          path: |
+            OpenGHub_${{ steps.meta.outputs.version }}.flatpak
+            flathub-manifest-${{ steps.meta.outputs.version }}.tar.gz
+
+  flatpak-upload:
+    name: Attach the bundle and the Flathub manifest
+    needs: flatpak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: flatpak-release
+
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          v="${{ steps.meta.outputs.version }}"
-          gh release upload "v$v" "OpenGHub_${v}.flatpak" "flathub-manifest-${v}.tar.gz" --clobber
+          v="${GITHUB_REF#refs/tags/v}"
+          gh release upload "v$v" "OpenGHub_${v}.flatpak" "flathub-manifest-${v}.tar.gz" \
+            --repo "${{ github.repository }}" --clobber

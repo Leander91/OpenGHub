@@ -65,6 +65,27 @@ pub fn set_enabled(on: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// Inside Flatpak the host's `~/.config/autostart` is out of reach (our
+/// `XDG_CONFIG_HOME` is the sandbox's own), so the Background portal writes
+/// the entry there instead; the desktop may ask the user first. The portal
+/// cannot be asked for the current state, so our copy of the entry in the
+/// sandbox's config dir is kept as the record of it.
+pub async fn set_enabled_portal(on: bool) -> Result<bool> {
+    use ashpd::desktop::background::Background;
+
+    let granted = Background::request()
+        .reason("Start OpenGHub in the tray when you log in")
+        .auto_start(on)
+        .command(["openghub", MINIMIZED_FLAG])
+        .dbus_activatable(false)
+        .send()
+        .await
+        .and_then(|r| r.response())
+        .map_err(|e| Error::other(format!("background portal: {e}")))?
+        .auto_start();
+    set_enabled(granted)
+}
+
 /// The `.desktop` text. `Exec` is quoted so a path with spaces survives.
 fn entry(exec: &str) -> String {
     let quoted = format!("\"{}\"", exec.replace('"', "\\\""));

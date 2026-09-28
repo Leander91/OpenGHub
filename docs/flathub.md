@@ -20,7 +20,9 @@ user lowercased, repository name as it is written. It is set in `src-tauri/tauri
    `flathub-manifest-<version>.tar.gz`, which holds exactly the two files Flathub wants:
    `io.github.slyvan25.OpenGHub.yml` (the .deb by URL and sha256, with `x-checker-data` so
    Flathub's bot proposes later versions by itself) and
-   `io.github.slyvan25.OpenGHub.metainfo.xml`.
+   `io.github.slyvan25.OpenGHub.metainfo.xml`. The manifest also pulls in the tray-icon library
+   from Flathub's [shared-modules](https://github.com/flathub/shared-modules), which the
+   submission carries as a git submodule.
 
 2. **Fork [flathub/flathub](https://github.com/flathub/flathub)** and branch from `new-pr`,
    *not* from `master`:
@@ -28,20 +30,29 @@ user lowercased, repository name as it is written. It is set in `src-tauri/tauri
    ```sh
    git clone git@github.com:<you>/flathub.git && cd flathub
    git checkout -b openghub origin/new-pr
-   tar -xzf ~/Downloads/flathub-manifest-0.1.1.tar.gz
+   tar -xzf ~/Downloads/flathub-manifest-0.1.4.tar.gz
+   git submodule add https://github.com/flathub/shared-modules.git
    git add io.github.slyvan25.OpenGHub.yml io.github.slyvan25.OpenGHub.metainfo.xml
    git commit -m "Add io.github.slyvan25.OpenGHub"
    git push -u origin openghub
    ```
 
 3. **Open a pull request against `new-pr`.** A bot builds the manifest and comments with the
-   result; a reviewer then reads it. Test the same build locally first:
+   result; a reviewer then reads it. Test the same build locally first, with Flathub's own
+   builder (a distribution's `flatpak-builder` may be too old for the runtime) and its linter:
 
    ```sh
-   flatpak install -y flathub org.gnome.Platform//47 org.gnome.Sdk//47
-   flatpak-builder --user --install --force-clean build-dir io.github.slyvan25.OpenGHub.yml
+   flatpak install --user -y flathub org.flatpak.Builder
+   flatpak run org.flatpak.Builder --user --install --force-clean --sandbox \
+     --install-deps-from=flathub --repo=repo build-dir io.github.slyvan25.OpenGHub.yml
+   flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest io.github.slyvan25.OpenGHub.yml
+   flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo
    flatpak run io.github.slyvan25.OpenGHub
    ```
+
+   Close any other running OpenGHub first: two instances on the same receiver get in each
+   other's way. The linter's `appstream-*-not-mirrored` / `appstream-external-screenshot-url`
+   errors are expected locally; Flathub's build mirrors the screenshots itself.
 
 4. **Answer the two questions that always come up.** Both are in the manifest's comments, but
    say it in the PR as well:

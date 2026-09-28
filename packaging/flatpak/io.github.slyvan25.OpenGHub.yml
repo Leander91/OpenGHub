@@ -1,7 +1,8 @@
 # Flatpak manifest. Built in CI from the release .deb (see release.yml), so the
-# binary is identical to the other packages; `flatpak-builder --user --install
-# build-dir packaging/flatpak/io.github.slyvan25.OpenGHub.yml` builds it locally once
-# OpenGHub_<version>_amd64.deb sits next to this file.
+# binary is identical to the other packages; `flatpak run org.flatpak.Builder --user
+# --install --force-clean build-dir packaging/flatpak/io.github.slyvan25.OpenGHub.yml` builds
+# it locally once OpenGHub_<version>_amd64.deb sits next to this file and the
+# shared-modules submodule is checked out (`git submodule update --init`).
 #
 # What the sandbox needs and why:
 #   --device=all                      /dev/hidraw* (HID++) and /dev/uinput (the FF wheel and
@@ -12,12 +13,12 @@
 #                                     xdg-open for the launcher, loginctl for "lock computer"
 #   --talk-name=org.kde.StatusNotifierWatcher
 #                                     the tray icon
-#   --filesystem=xdg-config/autostart:create
-#                                     "Launch at startup"
-#   read-only views of the game launchers' folders, for the Games tab
+#   read-only views of the Steam and Heroic folders, for the Games tab (Lutris is
+#   asked through `lutris --list-games` on the host). "Launch at startup" goes
+#   through the Background portal and needs nothing here.
 id: io.github.slyvan25.OpenGHub
 runtime: org.gnome.Platform
-runtime-version: "47"
+runtime-version: "50"
 sdk: org.gnome.Sdk
 command: openghub
 finish-args:
@@ -30,16 +31,17 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
   - --talk-name=org.kde.StatusNotifierWatcher
   - --talk-name=org.freedesktop.ScreenSaver
-  - --filesystem=xdg-config/autostart:create
   - --filesystem=~/.steam:ro
   - --filesystem=~/.local/share/Steam:ro
   - --filesystem=~/.var/app/com.valvesoftware.Steam/.local/share/Steam:ro
   - --filesystem=~/snap/steam/common/.local/share/Steam:ro
   - --filesystem=xdg-config/heroic:ro
   - --filesystem=~/.var/app/com.heroicgameslauncher.hgl/config/heroic:ro
-  - --filesystem=xdg-config/lutris:ro
-  - --filesystem=~/.var/app/net.lutris.Lutris/config/lutris:ro
 modules:
+  # The tray icon (tauri's tray-icon) dlopens libayatana-appindicator3 and
+  # panics at startup without it; the GNOME runtime does not ship it.
+  - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
+
   - name: openghub
     buildsystem: simple
     build-commands:

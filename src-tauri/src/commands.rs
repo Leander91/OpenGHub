@@ -169,9 +169,13 @@ pub async fn get_autostart() -> Result<bool> {
     Ok(crate::autostart::is_enabled())
 }
 
-/// Writes or removes the `~/.config/autostart` entry; returns the new state.
+/// Writes or removes the `~/.config/autostart` entry (through the Background
+/// portal under Flatpak); returns the new state.
 #[tauri::command]
 pub async fn set_autostart(on: bool) -> Result<bool> {
+    if crate::sandbox::in_flatpak() {
+        return crate::autostart::set_enabled_portal(on).await;
+    }
     crate::autostart::set_enabled(on)
 }
 
