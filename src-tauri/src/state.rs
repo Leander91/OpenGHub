@@ -39,6 +39,9 @@ pub struct Capabilities {
     /// Keys the host can disable (0x4522): Game Mode.
     #[serde(default)]
     pub game_mode: bool,
+    /// M1-M3 keys (0x8020), each with its own set of G-key bindings.
+    #[serde(default)]
+    pub m_keys: bool,
     /// A racing wheel driven through the classic command channel.
     #[serde(default)]
     pub wheel: bool,
@@ -1787,6 +1790,7 @@ fn probe(handle: &mut Handle, snapshot: &mut DeviceSnapshot, endpoint: &hidpp::E
         per_key: handle.supports(features::per_key::ID) && snapshot.kind == DeviceKind::Keyboard,
         // Done in software (gamemode.rs), so any keyboard can have it.
         game_mode: snapshot.kind == DeviceKind::Keyboard,
+        m_keys: handle.supports(features::mkeys::ID),
         wheel: false,
     };
 

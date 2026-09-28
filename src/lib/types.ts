@@ -57,6 +57,8 @@ export interface Capabilities {
   perKey?: boolean;
   /** Keys the host can disable: Game Mode. */
   gameMode?: boolean;
+  /** M1-M3 keys, each with its own G-key bindings. */
+  mKeys?: boolean;
   /** A racing wheel driven through the classic command channel. */
   wheel?: boolean;
 }

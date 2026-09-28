@@ -4,7 +4,7 @@
    * (G HUB's Freestyle and Game Mode pickers). Purely presentational — the
    * caller decides what a "paint" means and supplies the colours.
    */
-  import type { Key } from "$lib/keyboards/g915";
+  import type { Key } from "$lib/keyboards";
 
   interface Props {
     keys: Key[];

@@ -87,7 +87,11 @@
         />
       </div>
     {:else}
-      <p class="hint">No key map for this keyboard yet.</p>
+      <p class="hint">
+        The key map comes from G HUB's data for this keyboard. Import it under
+        <a href="/settings">Settings → G HUB data</a>; until then the Windows and Menu keys are what Game
+        Mode disables.
+      </p>
     {/if}
   {/snippet}
 </DeviceWorkspace>

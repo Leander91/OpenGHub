@@ -69,7 +69,9 @@ later than 0x8070's) and sets them with `setRgbClusterEffect`, whose payload mat
 13 LED ids, both `0xff`-terminated when shorter; fn 7 commits. The cluster effects are switched
 off first. LED ids on the G915 are `usage − 3` for ordinary keys, `usage − 0x78` for modifiers,
 `0xb3 + n` for G-keys, `0xd2` for the logo, and their own codes for the media keys — the
-numbering OpenRGB documents. `src/lib/keyboards/g915.ts` is OpenGHub's own drawn ISO map.
+numbering OpenRGB documents. Key positions only come from the device's G HUB depot (its per-key
+zones, see below): no keyboard has a hardcoded key map, and without imported G HUB data the
+per-key pages say how to import it.
 
 - **Freestyle** paints keys on that map; the colours live in the profile (`perKey`).
 - **Animations** are Freestyle frames played by `animation.rs`: per frame duration, fade or cut,
@@ -126,6 +128,9 @@ their own installation; OpenGHub then does what the official client does.
 - Some device entries are encrypted and their depots are named by id (the G502 X PLUS); built-in
   definitions cover those, and the depot is found by the model id in its `manifest.json`.
 - Resources can sit in subfolders (`images/device/<id>`), and per-LED zones can be circles.
+- Assignment controls come from the depot layout too — which buttons exist, where, and G HUB's
+  name for each (`G8`) — with each button's out-of-the-box action read from the device's own
+  factory table, not written into the code.
 - Per-key zones name each key by its component id — the HID usage in `PERKEY_KEYBOARD`, the G-key
   number in `PERKEY_GKEY`, the consumer usage in `PERKEY_CONSUMER` — so the key maps for Freestyle,
   animations and Game Mode are built from the depot and drawn over its render.

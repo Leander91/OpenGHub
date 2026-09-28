@@ -104,6 +104,7 @@ pub fn run() {
             commands::set_profile_lock,
             commands::reapply_lighting,
             commands::get_onboard_slots,
+            commands::get_default_bindings,
             commands::set_onboard_slot_enabled,
             commands::write_profile_to_slot,
             commands::get_connected_devices,

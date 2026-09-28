@@ -1,8 +1,7 @@
 /**
  * A keyboard's key map from its G HUB depot layout: every per-key zone is a
- * key at the position G HUB draws it, named by its HID usage. This is the
- * preferred source; `g915.ts` is only the fallback for when no G HUB data
- * has been imported.
+ * key at the position G HUB draws it, named by its HID usage. Positions only
+ * ever come from the depot: no device has a hardcoded key map.
  *
  * LED ids are the per-key numbering these keyboards use over 0x8081 (as
  * OpenRGB documents it): usage − 3 for ordinary keys, usage − 0x78 for
@@ -10,7 +9,20 @@
  * media keys and the brightness indicator.
  */
 import type { ArtworkView } from "$lib/types";
-import type { Key } from "./g915";
+/** One key of a drawn keyboard, in the layout's own units. */
+export interface Key {
+  /** Stable id for the UI. */
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** HID usage, for keys Game Mode can disable. */
+  usage?: number;
+  /** Per-key lighting id. */
+  led?: number;
+}
 
 const CONSUMER_LED: Record<number, number> = { 0xb6: 0x9e, 0xcd: 0x9b, 0xb5: 0x9d, 0xe2: 0x9c };
 
