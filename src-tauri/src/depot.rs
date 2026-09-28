@@ -689,7 +689,13 @@ pub fn import_device_files(
 ) -> Result<ImportedDevice, Error> {
     let dir = crate::artwork::ensure_dir()
         .map_err(|e| Error::other(format!("artwork directory: {e}")))?;
-    let get = |name: &str| files.iter().find(|(n, _)| n == name).map(|(_, d)| d.as_slice());
+    // Some newer depots encrypt their renders (the G502 X's, build 869589).
+    // Those are Logitech's protected files: they are never written out, and
+    // nothing here tries to read them.
+    let encrypted = |name: &str| files.iter().any(|(n, d)| n == name && d.starts_with(&ENCRYPTED_MAGIC));
+    let get = |name: &str| {
+        files.iter().find(|(n, d)| n == name && !d.starts_with(&ENCRYPTED_MAGIC)).map(|(_, d)| d.as_slice())
+    };
 
     // The manifest names the resources; fall back to the conventional names.
     let mut front = "front.png".to_string();
@@ -732,6 +738,14 @@ pub fn import_device_files(
             }
         },
         None => None,
+    };
+    // Markers and zones are positions on the render: without the render
+    // they would sit on whatever else is drawn, so they go with it.
+    let layout = if encrypted(&front) {
+        log::info!("{}: renders are encrypted; skipping its artwork and layout", def.display_name);
+        None
+    } else {
+        layout
     };
     /// Keeps the source's image format: the wheels ship WebP.
     fn ext_of(name: &str) -> &str {
