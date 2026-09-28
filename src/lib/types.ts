@@ -511,7 +511,16 @@ export interface ArtworkView {
   view: "front" | "side" | string;
   width: number;
   height: number;
-  zones: { id: string; locationName: string; x: number; y: number; width: number; height: number }[];
+  zones: {
+    id: string;
+    locationName: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    /** In per-key zones, the key: HID usage, G-key number or consumer usage. */
+    component?: number | null;
+  }[];
   controls: {
     slotId: string;
     control: string;
