@@ -673,6 +673,57 @@ fn perform(app: &tauri::AppHandle, ev: state::ButtonEvent) {
     }
 }
 
+/// The DPI stage colours, by rank from slowest to fastest — the same ladder
+/// the Sensitivity page draws (G HUB: yellow lowest, pink highest).
+const DPI_LADDER: [[u8; 3]; 5] = [[0xf5, 0xb4, 0x00], [0x6a, 0xd2, 0x4b], [0x11, 0x96, 0xff], [0x8a, 0x5c, 0xff], [0xff, 0x4f, 0xa3]];
+
+fn stage_colour(stages: &[u16], index: usize) -> [u8; 3] {
+    let value = stages[index];
+    let rank = stages.iter().filter(|v| **v < value).count();
+    let n = stages.len();
+    let at = if n <= 1 { 0 } else { ((rank as f32 / (n - 1) as f32) * (DPI_LADDER.len() - 1) as f32).round() as usize };
+    DPI_LADDER[at.min(DPI_LADDER.len() - 1)]
+}
+
+enum DpiColour {
+    /// Show the stage's colour briefly, then the profile's lighting again.
+    Flash,
+    /// Show it until `Restore` (DPI shift held).
+    Hold,
+    Restore,
+}
+
+/// G HUB shows a DPI change on the mouse's own lights, in the stage's colour.
+/// Only when the profile has lighting to go back to.
+fn dpi_colour(app: &tauri::AppHandle, device_id: &str, dp: &profiles::DeviceProfile, index: usize, how: DpiColour) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    if dp.lighting_zones.is_empty() || index >= dp.dpi_stages.len() {
+        return;
+    }
+    // A newer change cancels an older flash's restore.
+    let mine = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let manager = app.state::<DeviceManager>();
+    match how {
+        DpiColour::Restore => write_profile_lighting(app, device_id, None),
+        DpiColour::Hold | DpiColour::Flash => {
+            let rgb = stage_colour(&dp.dpi_stages, index);
+            if let Err(e) = manager.set_lighting(device_id, 0xff, rgb, hidpp::features::LightEffect::Fixed, false) {
+                log::debug!("{device_id}: dpi colour not shown: {e}");
+            }
+            if let DpiColour::Flash = how {
+                let (app, id) = (app.clone(), device_id.to_string());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1200));
+                    if GENERATION.load(Ordering::SeqCst) == mine {
+                        write_profile_lighting(&app, &id, None);
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// DPI up / down / cycle / default / shift against the profile's stage list,
 /// written to the device and saved back so the Sensitivity page follows.
 fn dpi_action(app: &tauri::AppHandle, device_id: &str, action: &remap::Action, pressed: bool) {
@@ -711,6 +762,8 @@ fn dpi_action(app: &tauri::AppHandle, device_id: &str, action: &remap::Action, p
     if let Action::DpiShift = action {
         let shift = dp.shift_stage.unwrap_or(0).min(last);
         let target = if pressed { dp.dpi_stages[shift] } else { dp.dpi_stages[current] };
+        // The shift speed's colour for as long as it is held.
+        dpi_colour(app, device_id, &dp, shift, if pressed { DpiColour::Hold } else { DpiColour::Restore });
         if let Err(e) = manager.set_dpi(device_id, target) {
             log::warn!("dpi shift failed: {e}");
         }
@@ -732,12 +785,13 @@ fn dpi_action(app: &tauri::AppHandle, device_id: &str, action: &remap::Action, p
         }
         _ => current,
     };
-    log::debug!("{device_id}: {action:?} stage {current} → {next} of {:?}", dp.dpi_stages);
+    log::info!("{device_id}: {action:?} stage {current} → {next} of {:?}", dp.dpi_stages);
     if next == current && !matches!(action, Action::DpiDefault) {
         return;
     }
     match manager.set_dpi(device_id, dp.dpi_stages[next]) {
         Ok(_) => {
+            dpi_colour(app, device_id, &dp, next, DpiColour::Flash);
             let id = device_id.to_string();
             let pid = profile.id.clone();
             let _ = store.update(|c| {
