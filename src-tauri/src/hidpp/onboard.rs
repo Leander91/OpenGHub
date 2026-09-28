@@ -183,8 +183,15 @@ pub enum Button {
     Key { modifiers: u8, usage: u8 },
     /// Consumer-control usage (media keys), big-endian.
     Consumer { usage: u16 },
-    /// Built-in action such as DPI up/down or profile cycle.
-    Special { action: u8 },
+    /// Built-in action such as DPI up/down or profile cycle. `param` is the
+    /// descriptor's last two bytes, kept verbatim: it is not padding — a G915
+    /// stores the target profile of M1–M3 there (`90 0d ff 01`), and a G502 X
+    /// writes `00 00` where older mice write `ff 00`.
+    Special {
+        action: u8,
+        #[serde(default = "special_default_param")]
+        param: [u8; 2],
+    },
     /// Runs a macro stored at `sector`/`offset`.
     Macro { sector: u8, offset: u16 },
     Disabled,
@@ -192,7 +199,19 @@ pub enum Button {
     Raw { bytes: [u8; 4] },
 }
 
+/// What a freshly assigned special action carries in its last two bytes.
+pub const SPECIAL_DEFAULT_PARAM: [u8; 2] = [0xff, 0x00];
+
+fn special_default_param() -> [u8; 2] {
+    SPECIAL_DEFAULT_PARAM
+}
+
 impl Button {
+    /// A special action with the default parameter bytes.
+    pub const fn special(action: u8) -> Self {
+        Button::Special { action, param: SPECIAL_DEFAULT_PARAM }
+    }
+
     pub fn decode(b: [u8; 4]) -> Self {
         match b[0] {
             BUTTON_MOUSE => match b[1] {
@@ -200,7 +219,7 @@ impl Button {
                 0x03 => Button::Consumer { usage: u16::from_be_bytes([b[2], b[3]]) },
                 _ => Button::Mouse { mask: u16::from_be_bytes([b[2], b[3]]) },
             },
-            BUTTON_SPECIAL => Button::Special { action: b[1] },
+            BUTTON_SPECIAL => Button::Special { action: b[1], param: [b[2], b[3]] },
             BUTTON_MACRO => Button::Macro { sector: b[1], offset: u16::from_be_bytes([b[2], b[3]]) },
             BUTTON_DISABLED => Button::Disabled,
             _ => Button::Raw { bytes: b },
@@ -218,7 +237,7 @@ impl Button {
                 let [h, l] = usage.to_be_bytes();
                 [BUTTON_MOUSE, 0x03, h, l]
             }
-            Button::Special { action } => [BUTTON_SPECIAL, action, 0xff, 0x00],
+            Button::Special { action, param } => [BUTTON_SPECIAL, action, param[0], param[1]],
             Button::Macro { sector, offset } => {
                 let [h, l] = offset.to_be_bytes();
                 [BUTTON_MACRO, sector, h, l]
@@ -307,6 +326,14 @@ pub fn write_sector(h: &mut Handle, sector: u16, data: &[u8]) -> Result<()> {
     let mut payload = data.to_vec();
     seal(&mut payload);
 
+    // Flash has limited write cycles, and callers rewrite whole profiles on
+    // every rescan. Unchanged content is not written again.
+    if read_sector(h, sector, size, false).ok().as_deref() == Some(&payload[..]) {
+        log::debug!("sector {sector} unchanged, not written");
+        return Ok(());
+    }
+    log::info!("writing onboard sector {sector}");
+
     // The declared length must be exactly the sector size. Rounding it up to a
     // whole number of 16-byte writes (256 for a 255-byte sector) is rejected as
     // "invalid argument"; the final write simply carries a partial chunk.
@@ -336,7 +363,7 @@ pub fn write_sector(h: &mut Handle, sector: u16, data: &[u8]) -> Result<()> {
 ///
 /// Opcodes are variable length, so a macro is a byte stream terminated by
 /// [`OP_END`] rather than a fixed-size table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "step")]
 pub enum MacroStep {
     /// HID keyboard usage code, e.g. 0x04 = 'a'.
@@ -350,6 +377,21 @@ pub enum MacroStep {
     MouseUp { mask: u16 },
     /// Pause in milliseconds.
     Delay { ms: u16 },
+    /// Software only (G HUB's TEXT, LAUNCH APPLICATION and SYSTEM entries).
+    /// A macro containing any of these never goes to onboard memory.
+    Text { text: String },
+    /// A command line, run detached.
+    Launch { command: String },
+    /// A key name or chord as `keymap::parse_chord` reads it, e.g.
+    /// `XF86AudioMute`, pressed and released.
+    System { value: String },
+}
+
+impl MacroStep {
+    /// Whether the device can store and play this step itself.
+    pub fn is_onboard(&self) -> bool {
+        !matches!(self, MacroStep::Text { .. } | MacroStep::Launch { .. } | MacroStep::System { .. })
+    }
 }
 
 pub const OP_NOOP: u8 = 0x00;
@@ -363,8 +405,11 @@ pub const OP_DELAY: u8 = 0x80;
 pub const OP_END: u8 = 0xff;
 
 impl MacroStep {
-    pub fn encode(self, out: &mut Vec<u8>) {
-        match self {
+    /// Appends the step's opcode. Software-only steps have none and are
+    /// skipped; `remap::action_for` keeps such macros off the device.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match *self {
+            MacroStep::Text { .. } | MacroStep::Launch { .. } | MacroStep::System { .. } => {}
             MacroStep::KeyDown { usage } => out.extend_from_slice(&[OP_KEY_DOWN, usage]),
             MacroStep::KeyUp { usage } => out.extend_from_slice(&[OP_KEY_UP, usage]),
             MacroStep::ModifiersDown { mask } => out.extend_from_slice(&[OP_MOD_DOWN, mask]),
@@ -798,10 +843,17 @@ mod tests {
         // Real descriptors read off a G502.
         assert_eq!(Button::decode([0x80, 0x01, 0x00, 0x01]), Button::Mouse { mask: 1 });
         assert_eq!(Button::decode([0x80, 0x01, 0x00, 0x10]), Button::Mouse { mask: 16 });
-        assert_eq!(Button::decode([0x90, 0x07, 0xff, 0x00]), Button::Special { action: 7 });
+        assert_eq!(Button::decode([0x90, 0x07, 0xff, 0x00]), Button::special(7));
         assert_eq!(Button::decode([0xff; 4]), Button::Disabled);
 
-        for raw in [[0x80, 0x01, 0x00, 0x08], [0x90, 0x04, 0xff, 0x00], [0xff; 4]] {
+        for raw in [
+            [0x80, 0x01, 0x00, 0x08],
+            [0x90, 0x04, 0xff, 0x00],
+            // G502 X PLUS DPI shift and G915 M2: both lost their bytes 2–3 once.
+            [0x90, 0x07, 0x00, 0x00],
+            [0x90, 0x0d, 0xff, 0x02],
+            [0xff; 4],
+        ] {
             assert_eq!(Button::decode(raw).encode(), raw, "round trip must be lossless");
         }
 

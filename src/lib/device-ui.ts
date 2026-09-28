@@ -99,7 +99,7 @@ export function zoneGlowsFor(
   });
 }
 
-export type TabId = "sensitivity" | "assignments" | "lighting" | "wheel" | "pedals" | "settings";
+export type TabId = "sensitivity" | "assignments" | "lighting" | "gamemode" | "wheel" | "pedals" | "settings";
 
 /**
  * The tabs a device can actually drive, in G HUB's rail order for a mouse:
@@ -123,6 +123,9 @@ export function tabsFor(device: Device): { id: TabId; label: string; icon: IconN
   }
   if (device.capabilities.lighting) {
     tabs.push({ id: "lighting", label: "LIGHTSYNC", icon: "lightsync" });
+  }
+  if (device.kind === "keyboard" && device.capabilities.gameMode) {
+    tabs.push({ id: "gamemode", label: "Game Mode", icon: "joystick" });
   }
   tabs.push({ id: "settings", label: "Settings", icon: "gear" });
   return tabs;

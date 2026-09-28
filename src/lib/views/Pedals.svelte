@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { configStore } from "$lib/stores/config.svelte";
   /**
    * Pedals — G HUB's pedal panel for wheels: per pedal a sensitivity preset
    * (Low / Medium / High, or the slider behind them), dead zones at both ends
@@ -45,8 +46,11 @@
 
   $effect(() => {
     const id = device.id;
-    if (seededFor === id) return;
-    seededFor = id;
+    // Per profile too: switching profiles with this page open must show the
+    // new profile's settings, or the next edit saves the old ones into it.
+    const key = `${configStore.activeProfileId}:${id}`;
+    if (seededFor === key) return;
+    seededFor = key;
     untrack(() => {
       api.getWheelSettings(id).then((s) => (settings = s)).catch(() => {});
       api.getWheelState(id).then((s) => (live = s)).catch(() => {});

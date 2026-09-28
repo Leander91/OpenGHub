@@ -148,3 +148,42 @@ transfer leaves the device in its bootloader, from where the update can simply b
 The confirmation dialog says so, and says that this path has not been exercised on every
 device family — the G502 LIGHTSPEED here has no package published, so it could not be run on
 this machine's hardware.
+
+## G-keys, M-keys and MR
+
+In host mode a G915's G-keys do nothing unless the host acts on them. `0x8010` fn 2 `[1]` diverts
+them: presses arrive through fn 0 as `[mask_lo, mask_hi]` (bit 0 = G1). With that on, M1–M3 report
+through `0x8020` fn 0 (`[mask]`) and MR through `0x8030` fn 0. OpenGHub runs the G-keys in software
+with F1–F5 as their defaults, keeps a set of bindings per M-key (`button-N:m2`, `button-N:m3`),
+lights the M-key LED (`0x8020` fn 1 `[mask]`) and hands the keys back on quit.
+
+**MR** records on the fly: MR (its LED via `0x8030` fn 0), a G-key, the keystrokes, MR again. The
+keystrokes are read from the keyboard's evdev nodes only for the duration of the recording.
+
+## Game Mode
+
+`0x4522` (DisableKeysByUsage) has four functions on a G915 — 0 reports a capacity of 255, 1–3
+accept key usages — but disabling A/S/D with function 1 or 2, in onboard and host mode, with the
+keyboard's own Game Mode key on and off, left every key working. Nobody documents it publicly.
+
+So Game Mode is done in software (`gamemode.rs`): while it is on, OpenGHub grabs the keyboard's
+key-bearing evdev nodes (`EVIOCGRAB`) and passes every key on through its virtual keyboard except
+the blocked ones — both Windows keys and Menu always, plus the keys chosen per profile. The kernel
+drops the grab when the process exits, so a crash cannot leave the keyboard dead. While grabbed,
+lock-key LEDs follow the virtual keyboard rather than the physical one.
+
+## On-board memory slots
+
+Sector 0 lists the profile slots, four bytes each: sector (big-endian), enabled, reserved. The
+slots page enables and disables them (never the last one) and writes a profile's DPI, firmware
+lighting and plain button bindings into a slot; on a keyboard with M-keys, slot N takes the MN
+bindings. Every write is backed up first, and unchanged sectors are not written at all.
+
+When a profile has nothing assigned, the button table goes back to the factory one, taken from
+the oldest backup under any of the device's ids (a device has a different product id wired and
+wireless). Without such a backup nothing is written.
+
+A lesson from v0.1.3 (#1): special button descriptors carry parameter bytes (`90 0d ff 01` is
+"switch to profile 1" on a G915), and the left-click guard must only apply to mice.
+`cargo run --example restore_sector` restores single sectors from a backup, verifying by reading
+back.

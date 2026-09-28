@@ -39,9 +39,13 @@ pub enum Action {
     ProfileNext,
     /// Hold to use the G-Shift layer's assignments.
     GShift,
-    /// Play these steps once per press.
+    /// Play these steps once per press (G HUB's "No repeat").
     Macro(Vec<MacroStep>),
+    /// G HUB's other macro types, which only software can run.
+    MacroRun(MacroPlay),
     LockScreen,
+    /// G HUB's MR key: start, target and finish an on-the-fly recording.
+    MacroRecord,
     Disabled,
 }
 
@@ -74,21 +78,47 @@ impl Action {
                 }
                 Button::Key { modifiers, usage: key.unwrap_or(0) }
             }
-            Action::DpiUp => Button::Special { action: 0x03 },
-            Action::DpiDown => Button::Special { action: 0x04 },
-            Action::DpiCycle => Button::Special { action: 0x05 },
-            Action::DpiDefault => Button::Special { action: 0x06 },
-            Action::DpiShift => Button::Special { action: 0x07 },
-            Action::ProfileNext => Button::Special { action: 0x0a },
-            Action::GShift => Button::Special { action: 0x0b },
+            Action::DpiUp => Button::special(0x03),
+            Action::DpiDown => Button::special(0x04),
+            Action::DpiCycle => Button::special(0x05),
+            Action::DpiDefault => Button::special(0x06),
+            Action::DpiShift => Button::special(0x07),
+            Action::ProfileNext => Button::special(0x0a),
+            Action::GShift => Button::special(0x0b),
             Action::Macro(_) => {
                 let (sector, offset) = macro_slot?;
                 Button::Macro { sector, offset }
             }
-            Action::LockScreen => return None,
+            Action::MacroRun(_) => return None,
+            Action::LockScreen | Action::MacroRecord => return None,
             Action::Disabled => Button::Disabled,
         })
     }
+}
+
+/// Which M-key state (1-3) an assignment belongs to. G HUB keeps a set of
+/// G-key bindings per M1/M2/M3; OpenGHub stores M2 and M3 as `button-1:m2`,
+/// `button-1:m3`, and anything without a suffix is M1.
+pub fn m_state(control: &str) -> u8 {
+    control
+        .split(':')
+        .find_map(|part| match part {
+            "m2" => Some(2),
+            "m3" => Some(3),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+/// The plan for G-keys in one M-state: that state's bindings, and F1..Fn for
+/// every key nothing is bound to — what the keys type on their own.
+pub fn gkey_plan(assignments: &[Assignment], macros: &[MacroDef], count: u8, state: u8) -> Plan {
+    let chosen: Vec<Assignment> = assignments.iter().filter(|a| m_state(&a.control) == state).cloned().collect();
+    let mut plan = Plan::build(&chosen, macros, 0);
+    for i in 0..count.min(12) {
+        plan.actions.entry(i).or_insert(Action::Keys(vec![crate::keymap::KEY_F1 + i as u16]));
+    }
+    plan
 }
 
 /// Physical button index (0-based) for an assignment's control id.
@@ -120,7 +150,27 @@ pub fn action_for(a: &Assignment, macros: &[MacroDef]) -> Option<Action> {
         },
         "macro" => {
             let def = macros.iter().find(|m| m.id == value)?;
-            Action::Macro(def.steps.clone())
+            let run = |mode| Action::MacroRun(MacroPlay { mode, steps: def.steps.clone(), ..Default::default() });
+            match def.kind.as_deref() {
+                Some("repeatWhileHolding") => run(MacroMode::RepeatWhileHolding),
+                Some("toggle") => run(MacroMode::Toggle),
+                Some("sequence") => {
+                    let s = def.sections.clone().unwrap_or_default();
+                    Action::MacroRun(MacroPlay {
+                        mode: MacroMode::Sequence,
+                        steps: if s.on_press.is_empty() && s.while_holding.is_empty() && s.on_release.is_empty() {
+                            def.steps.clone()
+                        } else {
+                            s.on_press
+                        },
+                        hold: s.while_holding,
+                        release: s.on_release,
+                    })
+                }
+                // Text, launch and system entries only software can play.
+                _ if def.steps.iter().any(|s| !s.is_onboard()) => run(MacroMode::Once),
+                _ => Action::Macro(def.steps.clone()),
+            }
         }
         "system" if value == "lock-screen" => Action::LockScreen,
         "command" | "key" | "system" => {
@@ -236,11 +286,49 @@ impl Plan {
     }
 }
 
+/// Starts a command line detached (G HUB's LAUNCH APPLICATION).
+pub fn launch(command: &str) {
+    let mut cmd = crate::sandbox::host_command("sh", &[]);
+    cmd.args(["-c", command])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(e) = cmd.spawn() {
+        log::warn!("could not launch '{command}': {e}");
+    }
+}
+
+/// How a macro runs, after G HUB's macro types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MacroMode {
+    /// Loops from the start while the button is held; the pass in progress
+    /// finishes after release.
+    #[default]
+    RepeatWhileHolding,
+    /// Plays once per press, like `Action::Macro`, for steps the device
+    /// cannot store.
+    Once,
+    /// First press starts looping, the next press stops it.
+    Toggle,
+    /// `steps` on press, `hold` looped while held, `release` on release.
+    Sequence,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MacroPlay {
+    pub mode: MacroMode,
+    pub steps: Vec<MacroStep>,
+    pub hold: Vec<MacroStep>,
+    pub release: Vec<MacroStep>,
+}
+
 /// The virtual keyboard everything injects through. One per app.
 pub struct Injector {
     device: Mutex<Option<VirtualDevice>>,
     /// Keys currently held by assignments, so a lost release cannot stick.
     held: Mutex<Vec<u16>>,
+    /// Looping macros by `device:button`; clearing the flag ends the loop.
+    loops: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Default for Injector {
@@ -251,7 +339,7 @@ impl Default for Injector {
 
 impl Injector {
     pub fn new() -> Self {
-        Injector { device: Mutex::new(None), held: Mutex::new(Vec::new()) }
+        Injector { device: Mutex::new(None), held: Mutex::new(Vec::new()), loops: Mutex::new(HashMap::new()) }
     }
 
     fn with_device<T>(&self, f: impl FnOnce(&VirtualDevice) -> std::io::Result<T>) -> std::io::Result<T> {
@@ -319,9 +407,82 @@ impl Injector {
     /// Plays macro steps on a separate thread so delays never block the pump.
     pub fn play_macro(self: &Arc<Self>, steps: Vec<MacroStep>) {
         let me = Arc::clone(self);
-        std::thread::spawn(move || {
-            for step in steps {
+        std::thread::spawn(move || me.run_steps(&steps));
+    }
+
+    /// One edge of a repeating, toggling or sequence macro on `key`
+    /// (`device:button`).
+    pub fn macro_edge(self: &Arc<Self>, key: &str, play: &MacroPlay, pressed: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let running = self.loops.lock().get(key).cloned();
+        let stop = |flag: Option<Arc<AtomicBool>>| {
+            if let Some(f) = flag {
+                f.store(false, Ordering::SeqCst);
+            }
+        };
+        match (play.mode, pressed) {
+            (MacroMode::Once, true) => {
+                let me = Arc::clone(self);
+                let steps = play.steps.clone();
+                std::thread::spawn(move || me.run_steps(&steps));
+            }
+            (MacroMode::Once, false) => {}
+            (MacroMode::Toggle, true) if running.is_some() => {
+                stop(self.loops.lock().remove(key));
+            }
+            (MacroMode::Toggle, false) => {}
+            (_, true) => {
+                stop(running);
+                let flag = Arc::new(AtomicBool::new(true));
+                self.loops.lock().insert(key.to_string(), Arc::clone(&flag));
+                let me = Arc::clone(self);
+                let play = play.clone();
+                std::thread::spawn(move || {
+                    let body = if play.mode == MacroMode::Sequence {
+                        me.run_steps(&play.steps);
+                        &play.hold
+                    } else {
+                        &play.steps
+                    };
+                    // An empty body would spin; a zero-length pass waits a tick.
+                    while flag.load(Ordering::SeqCst) {
+                        if body.is_empty() {
+                            std::thread::sleep(Duration::from_millis(10));
+                        } else {
+                            me.run_steps(body);
+                        }
+                    }
+                });
+            }
+            (_, false) => {
+                stop(self.loops.lock().remove(key));
+                if play.mode == MacroMode::Sequence && !play.release.is_empty() {
+                    let me = Arc::clone(self);
+                    let steps = play.release.clone();
+                    std::thread::spawn(move || me.run_steps(&steps));
+                }
+            }
+        }
+    }
+
+    /// Plays steps on the calling thread.
+    fn run_steps(&self, steps: &[MacroStep]) {
+        let me = self;
+        {
+            for step in steps.iter().cloned() {
                 let r = match step {
+                    MacroStep::Text { text } => me.type_text(&text),
+                    MacroStep::Launch { command } => {
+                        launch(&command);
+                        Ok(())
+                    }
+                    MacroStep::System { value } => match keymap::parse_chord(&value) {
+                        Some(chord) => me.chord(&chord.codes, true).and_then(|_| me.chord(&chord.codes, false)),
+                        None => {
+                            log::warn!("macro: unknown system command '{value}'");
+                            Ok(())
+                        }
+                    },
                     MacroStep::KeyDown { usage } => keymap::usage_code(usage).map(|c| me.key(c, true)).unwrap_or(Ok(())),
                     MacroStep::KeyUp { usage } => keymap::usage_code(usage).map(|c| me.key(c, false)).unwrap_or(Ok(())),
                     MacroStep::ModifiersDown { mask } => keymap::modifier_codes(mask).into_iter().try_for_each(|c| me.key(c, true)),
@@ -339,7 +500,29 @@ impl Injector {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-        });
+        }
+    }
+
+    /// Types `text` with the user's layout; characters it cannot type are
+    /// skipped (see `text.rs`).
+    fn type_text(&self, text: &str) -> std::io::Result<()> {
+        let map = crate::text::strokes();
+        for ch in text.chars() {
+            let Some(s) = map.get(&ch) else {
+                log::debug!("macro text: no key for {ch:?} on this layout");
+                continue;
+            };
+            let mods: Vec<u16> = [(s.shift, keymap::KEY_LEFTSHIFT), (s.altgr, keymap::KEY_RIGHTALT)]
+                .into_iter()
+                .filter_map(|(on, code)| on.then_some(code))
+                .collect();
+            let mut chord = mods.clone();
+            chord.push(s.code);
+            self.chord(&chord, true)?;
+            self.chord(&chord, false)?;
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        Ok(())
     }
 
     /// Whether any of `codes` is currently held through this keyboard.
@@ -378,6 +561,58 @@ mod tests {
 
     fn a(control: &str, category: &str, value: &str) -> Assignment {
         Assignment { control: control.into(), category: category.into(), label: String::new(), value: value.into() }
+    }
+
+    #[test]
+    fn macro_types_map_to_their_playback() {
+        use crate::hidpp::onboard::MacroStep::Delay;
+        let def = |kind: &str| MacroDef {
+            id: "m".into(),
+            name: "m".into(),
+            steps: vec![Delay { ms: 1 }],
+            kind: Some(kind.into()),
+            sections: Some(crate::profiles::MacroSections {
+                on_press: vec![Delay { ms: 2 }],
+                while_holding: vec![Delay { ms: 3 }],
+                on_release: vec![Delay { ms: 4 }],
+            }),
+            ..serde_json::from_str::<MacroDef>(r#"{"id":"m","name":"m","steps":[]}"#).unwrap()
+        };
+        let bind = a("button-1", "macro", "m");
+        assert!(matches!(action_for(&bind, &[def("noRepeat")]), Some(Action::Macro(_))));
+        let Some(Action::MacroRun(p)) = action_for(&bind, &[def("toggle")]) else { panic!() };
+        assert_eq!(p.mode, MacroMode::Toggle);
+        let Some(Action::MacroRun(p)) = action_for(&bind, &[def("sequence")]) else { panic!() };
+        assert_eq!((p.steps[0].clone(), p.hold[0].clone(), p.release[0].clone()), (Delay { ms: 2 }, Delay { ms: 3 }, Delay { ms: 4 }));
+        // Software only: never written to an onboard table.
+        assert_eq!(Action::MacroRun(p).onboard_button(Some((1, 0))), None);
+    }
+
+    #[test]
+    fn software_steps_keep_a_macro_off_the_device() {
+        use crate::hidpp::onboard::MacroStep;
+        let mut def: MacroDef = serde_json::from_str(r#"{"id":"m","name":"m","steps":[]}"#).unwrap();
+        def.steps = vec![MacroStep::Text { text: "gg".into() }, MacroStep::Launch { command: "true".into() }];
+        let Some(Action::MacroRun(p)) = action_for(&a("button-1", "macro", "m"), &[def]) else { panic!() };
+        assert_eq!(p.mode, MacroMode::Once);
+        // And they encode to nothing if they ever reach the encoder.
+        assert_eq!(crate::hidpp::onboard::encode_macro(&p.steps), crate::hidpp::onboard::encode_macro(&[]));
+    }
+
+    #[test]
+    fn m_states_keep_their_own_gkey_bindings() {
+        assert_eq!(m_state("button-1"), 1);
+        assert_eq!(m_state("button-1:m2"), 2);
+        assert_eq!(m_state("button-3:m3:gshift"), 3);
+        let set = [a("button-1", "system", "XF86AudioLowerVolume"), a("button-1:m2", "key", "a")];
+        let m1 = gkey_plan(&set, &[], 5, 1);
+        let m2 = gkey_plan(&set, &[], 5, 2);
+        let m3 = gkey_plan(&set, &[], 5, 3);
+        assert_eq!(m1.actions[&0], Action::Keys(vec![crate::keymap::KEY_VOLUMEDOWN]));
+        assert_ne!(m2.actions[&0], m1.actions[&0]);
+        // Unbound keys type F1..F5, in every state.
+        assert_eq!(m3.actions[&0], Action::Keys(vec![crate::keymap::KEY_F1]));
+        assert_eq!(m1.actions[&4], Action::Keys(vec![crate::keymap::KEY_F1 + 4]));
     }
 
     #[test]

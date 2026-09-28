@@ -7,6 +7,7 @@
    * performs the action; devices with onboard profiles get their button table
    * written too, so they keep working when the app is closed.
    */
+  import ProfileLock from "$lib/components/ProfileLock.svelte";
   import { untrack } from "svelte";
   import { page } from "$app/state";
   import * as api from "$lib/api";
@@ -103,8 +104,38 @@
     "pedal-accelerator": { dot: { x: 0.8, y: 0.4 }, label: { x: 1.06, y: 0.3 }, side: "right" },
   };
 
+  /**
+   * Models whose controls differ from the category default. `button-N` is
+   * index N-1 of the device's onboard button table, read off the real
+   * devices: a G502 X has its tilts at 7-8 and DPI up/down behind them, and a
+   * G915's table is G1-G5 followed by M1-M3 (which are not assignable).
+   */
+  const G502X: Control[] = [
+    { id: "button-1", label: "Left click", fallback: "Primary Click" },
+    { id: "button-2", label: "Right click", fallback: "Secondary Click" },
+    { id: "button-3", label: "Middle click", fallback: "Middle Click" },
+    { id: "button-4", label: "G4", fallback: "Back" },
+    { id: "button-5", label: "G6", fallback: "DPI Shift" },
+    { id: "button-6", label: "G5", fallback: "Forward" },
+    { id: "button-7", label: "Scroll left", fallback: "Scroll Left" },
+    { id: "button-8", label: "Scroll right", fallback: "Scroll Right" },
+    { id: "button-9", label: "G9", fallback: "Profile Cycle" },
+    { id: "button-10", label: "G8", fallback: "DPI Up" },
+    { id: "button-11", label: "G7", fallback: "DPI Down" },
+  ];
+  const G915: Control[] = Array.from({ length: 5 }, (_, i) => ({
+    id: `button-${i + 1}`,
+    label: `G${i + 1}`,
+    fallback: `F${i + 1}`,
+  }));
+  const MODEL_CONTROLS: Record<number, Control[]> = {
+    0xc095: G502X, 0x4099: G502X, 0xc098: G502X, 0xc097: G502X,
+    0xc33e: G915, 0x407c: G915, 0xc33f: G915,
+  };
+
   const controls = $derived(
-    device.kind === "keyboard" ? keyboardControls : device.kind === "wheel" ? wheelControls : mouseControls,
+    artworkIds(device).map((id) => MODEL_CONTROLS[id]).find(Boolean) ??
+      (device.kind === "keyboard" ? keyboardControls : device.kind === "wheel" ? wheelControls : mouseControls),
   );
 
   interface Command {
@@ -179,7 +210,10 @@
         { category: "action", label: "Next profile", value: "profile-next" },
         { category: "action", label: "Back", value: "mouse-back" },
         { category: "action", label: "Forward", value: "mouse-forward" },
-        { category: "action", label: "Unassign", value: "" },
+        // Removes the binding, so the control does what it does on its own.
+        { category: "action", label: "Use default", value: "" },
+        // Outputs nothing at all, even on the five standard mouse buttons.
+        { category: "action", label: "Disable", value: "disabled" },
       ],
     },
     {
@@ -222,8 +256,11 @@
 
   $effect(() => {
     const id = device.id;
-    if (seededFor === id) return;
-    seededFor = id;
+    // Per profile too: switching profiles with this page open must show the
+    // new profile's settings, or the next edit saves the old ones into it.
+    const key = `${configStore.activeProfileId}:${id}`;
+    if (seededFor === key) return;
+    seededFor = key;
 
     untrack(() => {
       const profile = configStore.deviceProfile(id);
@@ -258,9 +295,17 @@
       .filter((group) => group.items.length > 0),
   );
 
+  /**
+   * G HUB's M1/M2/M3 on keyboards with M-keys: each keeps its own G-key
+   * bindings, stored as `button-1:m2` / `button-1:m3` (M1 has no suffix).
+   */
+  const hasMKeys = $derived(controls === G915);
+  let mstate = $state<1 | 2 | 3>(1);
+
   /** Control id as stored for the current layer. */
   function keyFor(controlId: string): string {
-    return layer === "gshift" ? `${controlId}:gshift` : controlId;
+    const m = hasMKeys && mstate > 1 ? `:m${mstate}` : "";
+    return layer === "gshift" ? `${controlId}${m}:gshift` : `${controlId}${m}`;
   }
 
   function assignmentFor(controlId: string): Assignment | undefined {
@@ -283,6 +328,25 @@
     const button1 = layer.find((a) => base(a.control) === "button-1");
     if (!button1 || isPrimaryClick(button1)) return true;
     return layer.some((a) => base(a.control) !== "button-1" && isPrimaryClick(a));
+  }
+
+  /** G HUB: select a control and press Delete to remove its binding. */
+  function onKeydown(event: KeyboardEvent) {
+    if (event.key !== "Delete" && event.key !== "Backspace") return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("input, textarea, select, [contenteditable]")) return;
+    // The macro editor records keys, Backspace included.
+    if (editingMacro || primaryDialog) return;
+    if (!selected || !assignmentFor(selected)) return;
+    void assign(selected, { category: "action", label: "Use default", value: "" });
+  }
+
+  /** G HUB's right-click "Use default": drop the binding on this layer. */
+  function resetControl(event: MouseEvent, controlId: string) {
+    event.preventDefault();
+    selected = controlId;
+    if (!assignmentFor(controlId)) return;
+    void assign(controlId, { category: "action", label: "Use default", value: "" });
   }
 
   async function assign(controlId: string, command: Command) {
@@ -346,18 +410,49 @@
     return controls.find((c) => c.id === id)?.label ?? id;
   }
 
-  function onDragStart(event: DragEvent, command: Command) {
-    event.dataTransfer?.setData("application/json", JSON.stringify(command));
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
+  // -- drag a command or macro onto a button (G HUB's drag and drop) -------------------
+  //
+  // Pointer-driven rather than HTML5 drag and drop, which WebKitGTK handles
+  // unreliably: press on a list item, move past a few pixels, drop on a key.
+
+  type Payload = { command: Command } | { macro: MacroDef };
+  let drag = $state<{ payload: Payload; label: string; x: number; y: number; started: boolean; x0: number; y0: number } | null>(null);
+
+  function beginDrag(event: PointerEvent, payload: Payload, label: string) {
+    if (event.button !== 0) return;
+    drag = { payload, label, x: event.clientX, y: event.clientY, x0: event.clientX, y0: event.clientY, started: false };
   }
 
-  function onDrop(event: DragEvent, controlId: string) {
-    event.preventDefault();
-    dragOver = null;
-    const raw = event.dataTransfer?.getData("application/json");
-    if (!raw) return;
-    assign(controlId, JSON.parse(raw) as Command);
+  /** The control under the pointer: dots and callouts carry `data-control`. */
+  function controlAt(x: number, y: number): string | null {
+    const el = document.elementFromPoint(x, y)?.closest("[data-control]");
+    return el?.getAttribute("data-control") ?? null;
   }
+
+  function onPointerMove(event: PointerEvent) {
+    if (!drag) return;
+    const moved = Math.hypot(event.clientX - drag.x0, event.clientY - drag.y0) > 6;
+    drag = { ...drag, x: event.clientX, y: event.clientY, started: drag.started || moved };
+    if (drag.started) dragOver = controlAt(event.clientX, event.clientY);
+  }
+
+  function onPointerUp(event: PointerEvent) {
+    if (!drag) return;
+    const { payload, started } = drag;
+    drag = null;
+    dragOver = null;
+    if (!started) return; // a plain click: the item's own onclick handles it
+    const target = controlAt(event.clientX, event.clientY);
+    if (!target) return;
+    // A click follows the pointerup on the item; swallow it so the drop is all that happens.
+    suppressClick = true;
+    setTimeout(() => (suppressClick = false), 0);
+    selected = target;
+    if ("macro" in payload) void assignMacro(payload.macro);
+    else void assign(target, payload.command);
+  }
+
+  let suppressClick = false;
 
   /** Which library group the panel is showing, like G HUB's sub-tabs. */
   let group = $state("Commands");
@@ -602,8 +697,15 @@
   }
 </script>
 
+<svelte:window onkeydown={onKeydown} onpointermove={onPointerMove} onpointerup={onPointerUp} />
+
+{#if drag?.started}
+  <div class="drag-ghost" style="left: {drag.x + 12}px; top: {drag.y + 8}px">{drag.label}</div>
+{/if}
+
 <DeviceWorkspace title="Assignments">
   {#snippet panel()}
+    <ProfileLock deviceId={device.id} feature="assignments" />
     <div class="group-tabs" role="tablist">
       {#each [...library.slice(0, 3), { name: "Macros" }, ...library.slice(3)] as g (g.name)}
         <button
@@ -629,7 +731,12 @@
       <div class="macros">
         {#each macros as def (def.id)}
           <div class="macro">
-            <button class="macro-row" onclick={() => assignMacro(def)} title="Assign to {controlLabel(selected)}">
+            <button
+              class="macro-row"
+              onpointerdown={(e) => beginDrag(e, { macro: def }, def.name)}
+              onclick={() => !suppressClick && assignMacro(def)}
+              title="Assign to {controlLabel(selected)}, or drag onto a button"
+            >
               <span class="macro-swatch" style={def.color ? `background:${def.color}` : ""}></span>
               <span class="macro-name">{def.name}</span>
               <span class="macro-meta">{def.steps.length} steps</span>
@@ -694,6 +801,14 @@
           {/each}
         </div>
       {/if}
+      {#if hasMKeys}
+        <div class="views" role="group" aria-label="M-key state">
+          {#each [1, 2, 3] as const as m (m)}
+            <button class="view-pill" class:active={mstate === m} onclick={() => (mstate = m)}>M{m}</button>
+          {/each}
+        </div>
+      {/if}
+      {#if !hasMKeys}
       <div class="layers">
         <span class:on={layer === "default"}>Default</span>
         <button
@@ -706,6 +821,7 @@
         ></button>
         <span class:on={layer === "gshift"}>G-Shift</span>
       </div>
+      {/if}
     </div>
   {/snippet}
 
@@ -745,13 +861,10 @@
             class:dragover={dragOver === control.id}
             style="left: {spot.dot.x * 100}%; top: {spot.dot.y * 100}%"
             aria-label={control.label}
+            title="Right-click to restore the default"
             onclick={() => (selected = control.id)}
-            ondragover={(e) => {
-              e.preventDefault();
-              dragOver = control.id;
-            }}
-            ondragleave={() => (dragOver = null)}
-            ondrop={(e) => onDrop(e, control.id)}
+            oncontextmenu={(e) => resetControl(e, control.id)}
+            data-control={control.id}
           ></button>
 
           <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
@@ -761,12 +874,8 @@
             class:dragover={dragOver === control.id}
             style="left: {spot.label.x * 100}%; top: {spot.label.y * 100}%"
             onclick={() => (selected = control.id)}
-            ondragover={(e) => {
-              e.preventDefault();
-              dragOver = control.id;
-            }}
-            ondragleave={() => (dragOver = null)}
-            ondrop={(e) => onDrop(e, control.id)}
+            oncontextmenu={(e) => resetControl(e, control.id)}
+            data-control={control.id}
           >
             <span class="callout-binding" class:bound={!!bound} title={control.label}>
               {bound?.label ?? control.fallback}
@@ -790,9 +899,8 @@
       <button
         class="command"
         class:clear-command={item.value === ""}
-        draggable="true"
-        ondragstart={(e) => onDragStart(e, item)}
-        onclick={() => assign(selected, item)}
+        onpointerdown={(e) => beginDrag(e, { command: item }, item.label)}
+        onclick={() => !suppressClick && assign(selected, item)}
       >
         <span class="command-key">{prettyKeys(item.value)}</span>
         <span class="command-name">{item.label}</span>
@@ -1281,5 +1389,18 @@
     font-weight: 600;
   }
 
+
+  .drag-ghost {
+    position: fixed;
+    z-index: 1000;
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--accent, #1196ff);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  }
 
 </style>

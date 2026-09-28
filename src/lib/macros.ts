@@ -14,7 +14,32 @@ export type MacroStep =
   | { step: "modifiersUp"; mask: number }
   | { step: "mouseDown"; mask: number }
   | { step: "mouseUp"; mask: number }
-  | { step: "delay"; ms: number };
+  | { step: "delay"; ms: number }
+  // Software only: played by OpenGHub, never stored on the device.
+  | { step: "text"; text: string }
+  | { step: "launch"; command: string }
+  | { step: "system"; value: string };
+
+/** Whether the device can store this step (the rest need OpenGHub running). */
+export function isOnboardStep(s: MacroStep): boolean {
+  return s.step !== "text" && s.step !== "launch" && s.step !== "system";
+}
+
+/** G HUB's SYSTEM entries, as key names the backend understands. */
+export const SYSTEM_COMMANDS: { label: string; value: string }[] = [
+  { label: "Volume up", value: "XF86AudioRaiseVolume" },
+  { label: "Volume down", value: "XF86AudioLowerVolume" },
+  { label: "Mute", value: "XF86AudioMute" },
+  { label: "Play / pause", value: "XF86AudioPlay" },
+  { label: "Next track", value: "XF86AudioNext" },
+  { label: "Previous track", value: "XF86AudioPrev" },
+  { label: "Screenshot", value: "Print" },
+  { label: "Copy", value: "ctrl+c" },
+  { label: "Paste", value: "ctrl+v" },
+  { label: "Cut", value: "ctrl+x" },
+  { label: "Undo", value: "ctrl+z" },
+  { label: "Select all", value: "ctrl+a" },
+];
 
 export type { MacroDef } from "./types";
 
@@ -30,8 +55,16 @@ const USAGES: Record<string, number> = {
   Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35,
   Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39,
   ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, 0x3a + i])),
+  PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49,
   Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e,
   ArrowRight: 0x4f, ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52,
+  NumLock: 0x53, NumpadDivide: 0x54, NumpadMultiply: 0x55, NumpadSubtract: 0x56,
+  NumpadAdd: 0x57, NumpadEnter: 0x58,
+  ...Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`Numpad${i + 1}`, 0x59 + i])),
+  Numpad0: 0x62, NumpadDecimal: 0x63,
+  // The ISO key beside left Shift: `< >` on Nordic and German layouts.
+  IntlBackslash: 0x64, ContextMenu: 0x65,
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 13}`, 0x68 + i])),
 };
 
 /** Modifier bitmask values, matching the HID keyboard report. */
@@ -74,12 +107,20 @@ export function describeStep(step: MacroStep): string {
       return `↑ mouse ${Math.log2(step.mask) + 1}`;
     case "delay":
       return `wait ${step.ms} ms`;
+    case "text":
+      return `“${step.text}”`;
+    case "launch":
+      return `run ${step.command}`;
+    case "system":
+      return SYSTEM_COMMANDS.find((c) => c.value === step.value)?.label ?? step.value;
   }
 }
 
 function prettyKey(code: string | undefined): string {
   if (!code) return "?";
+  if (code === "IntlBackslash") return "< >";
   return code
+    .replace(/^Numpad/, "Num ")
     .replace(/^Key/, "")
     .replace(/^Digit/, "")
     .replace(/(Left|Right)$/, "")
@@ -94,7 +135,7 @@ export function macroDuration(steps: MacroStep[]): number {
 /** Encoded size on the device, to warn before a macro overflows its sector. */
 export function encodedSize(steps: MacroStep[]): number {
   const size = (s: MacroStep) =>
-    s.step === "mouseDown" || s.step === "mouseUp" || s.step === "delay" ? 3 : 2;
+    !isOnboardStep(s) ? 0 : s.step === "mouseDown" || s.step === "mouseUp" || s.step === "delay" ? 3 : 2;
   return steps.reduce((total, s) => total + size(s), 0) + 1; // + terminator
 }
 

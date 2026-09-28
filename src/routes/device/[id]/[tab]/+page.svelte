@@ -4,6 +4,7 @@
   import Assignments from "$lib/views/Assignments.svelte";
   import DeviceSettings from "$lib/views/DeviceSettings.svelte";
   import Lighting from "$lib/views/Lighting.svelte";
+  import GameMode from "$lib/views/GameMode.svelte";
   import Sensitivity from "$lib/views/Sensitivity.svelte";
   import SteeringWheel from "$lib/views/SteeringWheel.svelte";
   import Pedals from "$lib/views/Pedals.svelte";
@@ -20,6 +21,8 @@
       <Assignments {device} />
     {:else if tab === "lighting"}
       <Lighting {device} />
+    {:else if tab === "gamemode"}
+      <GameMode {device} />
     {:else if tab === "wheel"}
       <SteeringWheel {device} />
     {:else if tab === "pedals"}

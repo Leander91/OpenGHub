@@ -12,7 +12,7 @@ use crate::hidpp::registry::{self, DeviceKind};
 use crate::profiles::{Assignment, MacroDef};
 use crate::remap::{self, Action, Plan};
 use crate::wheel::{self, WheelHandle, WheelSettings, WheelState};
-use crate::hidpp::{self, DeviceAddress, Error, Handle, Result, RECEIVER_CHILD_INDICES};
+use crate::hidpp::{self, DeviceAddress, Error, Handle, ReportKind, Result, RECEIVER_CHILD_INDICES};
 
 /// How the device is attached, which is what the card's status row shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +33,12 @@ pub struct Capabilities {
     pub battery: bool,
     pub lighting: bool,
     pub onboard_memory: bool,
+    /// Individually lit keys (0x8081): Freestyle and animations.
+    #[serde(default)]
+    pub per_key: bool,
+    /// Keys the host can disable (0x4522): Game Mode.
+    #[serde(default)]
+    pub game_mode: bool,
     /// A racing wheel driven through the classic command channel.
     #[serde(default)]
     pub wheel: bool,
@@ -124,6 +130,7 @@ impl DeviceSnapshot {
                 vendor_id: crate::hidpp::LOGITECH_VID,
                 product_id: handle.model.product_id,
                 device_index: hidpp::DEVICE_INDEX_WIRED,
+                port: None,
             },
             hid_product.unwrap_or_else(|| handle.model.name.to_string()),
             DeviceKind::Wheel,
@@ -159,6 +166,21 @@ pub struct AssignmentReport {
 
 /// A button edge on a device the pump is watching. `action` is `None` for
 /// buttons without an assignment; scripts still hear about those.
+/// One on-board memory slot (G HUB's ON-BOARD MEMORY SLOTS).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardSlot {
+    pub index: u8,
+    pub sector: u16,
+    /// Can be cycled to and used.
+    pub enabled: bool,
+    /// The slot the device is running now.
+    pub active: bool,
+}
+
+/// `ButtonEvent::button` of a keyboard's MR key.
+pub const MR_BUTTON: u8 = 0xfe;
+
 #[derive(Debug, Clone)]
 pub struct ButtonEvent {
     pub device_id: String,
@@ -203,10 +225,21 @@ struct Inner {
     /// index for the mice that report through the spy.
     plans: HashMap<String, Plan>,
     spy_index: HashMap<String, u8>,
+    /// Keyboards whose G-keys report through `0x8010` in software mode, with
+    /// that feature's index. Needed in host mode, which RGB on a G915 is:
+    /// there the keys do nothing unless the host acts on them.
+    gkey_index: HashMap<String, u8>,
+    /// Per keyboard: the 0x8020 index, the G-key count, the current M-state
+    /// (1-3) and the bindings to rebuild its plan from when M1-M3 is pressed.
+    mkeys: HashMap<String, MKeys>,
     /// Fingerprint of what was last written to each device's onboard button
     /// table, so profile switches and restarts do not rewrite flash needlessly.
     onboard_written: HashMap<String, u64>,
     snapshots: HashMap<String, DeviceSnapshot>,
+    /// Address id (`046d:c547:1@3-6`) → the device's own id. A device keeps
+    /// one id however it is connected, so its profile follows it from cable
+    /// to receiver the way G HUB's does.
+    aliases: HashMap<String, String>,
     order: Vec<String>,
     /// True when we are showing synthetic devices because no real ones were found.
     demo: bool,
@@ -238,6 +271,9 @@ impl DeviceManager {
                 spy_index: HashMap::new(),
                 onboard_written: HashMap::new(),
                 snapshots: HashMap::new(),
+                aliases: HashMap::new(),
+                gkey_index: HashMap::new(),
+                mkeys: HashMap::new(),
                 order: Vec::new(),
                 demo: false,
                 empty_reason: init_error
@@ -487,6 +523,11 @@ impl DeviceManager {
     ) -> Result<AssignmentReport> {
         let mut inner = self.inner.lock();
         let mut report = AssignmentReport::default();
+        let all_assignments = assignments;
+        // M2/M3 bindings only exist in software; the plan and the onboard
+        // table below see the M1 set.
+        let m1: Vec<Assignment> = assignments.iter().filter(|a| remap::m_state(&a.control) == 1).cloned().collect();
+        let assignments = &m1[..];
         if inner.demo {
             return Ok(report);
         }
@@ -504,6 +545,38 @@ impl DeviceManager {
             let idx = if spy { h.feature_index(features::button_spy::ID).ok() } else { None };
             Ok((spy, onboard, idx))
         })?;
+
+        // G-keys (G915, G815): divert them to the host and act on them here,
+        // with F1..Fn for any key nothing is assigned to — what they type
+        // on their own.
+        let state = inner.mkeys.get(id).map(|m| m.state).unwrap_or(1);
+        let gkeys = inner.with_handle(id, |h| {
+            if !h.supports(features::gkeys::ID) {
+                return Ok(None);
+            }
+            let idx = h.feature_index(features::gkeys::ID)?;
+            let count = h.call(idx, features::gkeys::FN_GET_COUNT, &[], ReportKind::Long)?.param(0);
+            h.call(idx, features::gkeys::FN_SOFTWARE_CONTROL, &[0x01], ReportKind::Long)?;
+            let midx = h.feature_index(features::mkeys::ID).ok();
+            if let Some(m) = midx {
+                let _ = h.call(m, features::mkeys::FN_SET_LEDS, &[1 << (state - 1)], ReportKind::Long);
+            }
+            let mr = h.feature_index(features::mr::ID).ok();
+            Ok(Some((idx, count, midx, mr)))
+        });
+        match gkeys {
+            Ok(Some((idx, count, midx, mr))) => {
+                report.software = true;
+                inner.gkey_index.insert(id.to_string(), idx);
+                inner.plans.insert(id.to_string(), remap::gkey_plan(all_assignments, macros, count, state));
+                inner.mkeys.insert(
+                    id.to_string(),
+                    MKeys { index: midx, mr, count, state, assignments: all_assignments.to_vec(), macros: macros.to_vec() },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("{id}: G-keys not taken over: {e}"),
+        }
 
         let onboard_chosen = inner.snapshots.get(id).and_then(|s| s.onboard_mode).unwrap_or(false);
         if spy && !onboard_chosen {
@@ -536,11 +609,23 @@ impl DeviceManager {
             serde_json::to_string(macros).unwrap_or_default().hash(&mut h);
             h.finish()
         };
-        if onboard && inner.onboard_written.get(id) == Some(&fingerprint) {
+        // Every id the device goes by, for its factory table (see below).
+        let ids: Vec<u16> = inner
+            .snapshots
+            .get(id)
+            .map(|s| s.model_ids.iter().copied().chain([s.product_id]).collect())
+            .unwrap_or_default();
+        // With nothing assigned the table goes back to the factory one, so a
+        // binding removed in OpenGHub leaves the device too. Without a backup
+        // to take that table from, nothing is written. (Unchanged sectors are
+        // never rewritten, so this costs no flash.)
+        let no_factory = assignments.is_empty() && factory_buttons(&ids, 1).is_empty();
+        if onboard && (no_factory || inner.onboard_written.get(id) == Some(&fingerprint)) {
             report.onboard = true;
         } else if onboard {
             use crate::hidpp::onboard;
             let product_id = inner.snapshots.get(id).map(|s| s.product_id).unwrap_or(0);
+            let is_mouse = inner.snapshots.get(id).map(|s| s.kind == DeviceKind::Mouse).unwrap_or(false);
             let result = inner.with_handle(id, |h| {
                 let info = onboard::read_info(h)?;
                 let size = info.sector_size as usize;
@@ -561,7 +646,7 @@ impl DeviceManager {
                 // Writing only the assigned ones let stale bindings pile up
                 // across profiles (a left click pointing at a dead macro).
                 let count = info.button_count as usize;
-                let factory = factory_buttons(product_id, count);
+                let factory = factory_buttons(&ids, count);
                 let mut buttons: Vec<(u8, bool, onboard::Button)> = Vec::new();
                 let mut macro_assignments: Vec<onboard::MacroAssignment> = Vec::new();
                 let mut covered = vec![false; count];
@@ -600,9 +685,10 @@ impl DeviceManager {
                         buttons.push((i as u8, true, onboard::Button::Disabled));
                     }
                 }
-                // Same guard as the software plan: something must be the left click.
+                // Same guard as the software plan: something must be the left
+                // click. Mice only — on a keyboard button 0 is G1, not a click.
                 let has_primary = buttons.iter().any(|(_, sh, b)| !sh && matches!(b, onboard::Button::Mouse { mask: 1 }));
-                if !has_primary && count > 0 {
+                if is_mouse && !has_primary && count > 0 {
                     buttons.retain(|(i, sh, _)| *sh || *i != 0);
                     macro_assignments.retain(|m| m.shifted || m.button != 0);
                     buttons.push((0, false, onboard::Button::Mouse { mask: 1 }));
@@ -632,6 +718,58 @@ impl DeviceManager {
                     w.poll();
                 }
                 Some(crate::wheel::ghub_mask(&w.state.lock()))
+            } else if let Some(gidx) = inner.gkey_index.get(&id).copied() {
+                let events = match inner.handles.get_mut(&id) {
+                    Some(h) => h.poll_events(),
+                    None => continue,
+                };
+                // M1-M3 switch the G-key bindings, as in G HUB, and light
+                // their own LED.
+                let mut new_state = None;
+                if let Some(mk) = inner.mkeys.get(&id) {
+                    // MR goes to the recorder in lib.rs as its own button.
+                    for ev in events.iter().filter(|ev| Some(ev.feature_index) == mk.mr && ev.function_id() == 0) {
+                        out.push(ButtonEvent {
+                            device_id: id.clone(),
+                            button: MR_BUTTON,
+                            pressed: ev.param(0) & 1 != 0,
+                            action: Some(Action::MacroRecord),
+                            wheel: false,
+                        });
+                    }
+                    for ev in &events {
+                        if Some(ev.feature_index) == mk.index && ev.function_id() == 0 && ev.param(0) & 0x07 != 0 {
+                            new_state = Some(ev.param(0).trailing_zeros() as u8 + 1);
+                        }
+                    }
+                }
+                if let Some(state) = new_state {
+                    if let Some(mk) = inner.mkeys.get_mut(&id) {
+                        mk.state = state;
+                        let plan = remap::gkey_plan(&mk.assignments, &mk.macros, mk.count, state);
+                        let midx = mk.index;
+                        inner.plans.insert(id.clone(), plan);
+                        if let Some(m) = midx {
+                            let _ = inner.with_handle(&id, |h| {
+                                h.call(m, features::mkeys::FN_SET_LEDS, &[1 << (state - 1)], ReportKind::Long).map(|_| ())
+                            });
+                        }
+                        log::info!("{id}: M{state}");
+                    }
+                }
+                let plan = inner.plans.get_mut(&id).expect("plan");
+                for ev in events {
+                    // `[mask_lo, mask_hi]`, bit 0 = G1.
+                    if ev.feature_index != gidx || ev.function_id() != 0 {
+                        continue;
+                    }
+                    let mask = u16::from_le_bytes([ev.param(0), ev.param(1)]) as u32;
+                    for (button, pressed) in plan.transitions(mask) {
+                        let action = plan.resolve(button, pressed);
+                        out.push(ButtonEvent { device_id: id.clone(), button, pressed, action, wheel: false });
+                    }
+                }
+                None
             } else if let Some(spy) = inner.spy_index.get(&id).copied() {
                 let events = match inner.handles.get_mut(&id) {
                     Some(h) => h.poll_events(),
@@ -696,6 +834,13 @@ impl DeviceManager {
                     let _ = features::set_spy(h, false);
                     let _ = features::write_remapping(h, &table);
                 }
+                // Game Mode must never outlive the app.
+                if h.supports(features::disable_keys::ID) {
+                    let _ = features::set_disabled_keys(h, &[]);
+                }
+                if let Ok(idx) = h.feature_index(features::gkeys::ID) {
+                    let _ = h.call(idx, features::gkeys::FN_SOFTWARE_CONTROL, &[0x00], ReportKind::Long);
+                }
                 if h.supports(features::onboard::ID) {
                     let _ = features::write_onboard_mode(h, features::onboard::MODE_ONBOARD);
                 }
@@ -703,6 +848,7 @@ impl DeviceManager {
             });
         }
         inner.plans.clear();
+        inner.gkey_index.clear();
     }
 
     // -- wheels ---------------------------------------------------------------
@@ -1008,6 +1154,131 @@ impl DeviceManager {
         })
     }
 
+    /// Per-key colours by LED id (0x8081).
+    pub fn set_per_key(&self, id: &str, leds: &[(u8, [u8; 3])]) -> Result<()> {
+        self.set_per_key_frame(id, leds, true)
+    }
+
+    /// One animation frame; `take_over` only for the first.
+    pub fn set_per_key_frame(&self, id: &str, leds: &[(u8, [u8; 3])], take_over: bool) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        inner.with_handle(id, |h| features::write_per_key_frame(h, leds, take_over))
+    }
+
+    /// G HUB's on-board memory slots: each profile slot, whether it can be
+    /// cycled to, and which one the device is running.
+    pub fn onboard_slots(&self, id: &str) -> Result<Vec<OnboardSlot>> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let dir = onboard::parse_directory(&onboard::read_sector(h, 0, info.sector_size as usize, true)?);
+            let idx = h.feature_index(onboard::ID)?;
+            let current = h.call(idx, onboard::FN_GET_CURRENT_PROFILE, &[], ReportKind::Long).map(|p| p.param_u16(0)).ok();
+            Ok(dir
+                .iter()
+                .enumerate()
+                .map(|(i, e)| OnboardSlot { index: i as u8, sector: e.sector, enabled: e.enabled, active: current == Some(e.sector) })
+                .collect())
+        })
+    }
+
+    /// Enables or disables one slot in the directory (sector 0). The last
+    /// enabled slot cannot be disabled. Backs up first.
+    pub fn set_onboard_slot_enabled(&self, id: &str, index: u8, enabled: bool) -> Result<()> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        let product_id = inner.snapshots.get(id).map(|s| s.product_id).unwrap_or(0);
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let size = info.sector_size as usize;
+            let mut dir = onboard::read_sector(h, 0, size, true)?;
+            let entries = onboard::parse_directory(&dir);
+            let at = index as usize;
+            if at >= entries.len() {
+                return Err(Error::other(format!("slot {} does not exist", index + 1)));
+            }
+            if !enabled && entries.iter().enumerate().all(|(i, e)| i == at || !e.enabled) {
+                return Err(Error::other("at least one on-board slot has to stay enabled"));
+            }
+            write_backup(&onboard::backup(h, id, product_id)?)?;
+            dir[at * 4 + 2] = enabled as u8;
+            onboard::write_sector(h, 0, &dir)
+        })
+    }
+
+    /// Writes DPI, lighting and plain button bindings into one slot.
+    /// Buttons not listed, and every macro, stay as they are. Backs up first.
+    pub fn write_onboard_slot(
+        &self,
+        id: &str,
+        index: u8,
+        dpi: Option<(Vec<u16>, u8, u8, Option<u32>)>,
+        leds: &[(u8, u8, [u8; 10])],
+        buttons: &[(u8, crate::hidpp::onboard::Button)],
+    ) -> Result<()> {
+        use crate::hidpp::onboard;
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        let product_id = inner.snapshots.get(id).map(|s| s.product_id).unwrap_or(0);
+        inner.with_handle(id, |h| {
+            let info = onboard::read_info(h)?;
+            let size = info.sector_size as usize;
+            let dir = onboard::parse_directory(&onboard::read_sector(h, 0, size, true)?);
+            let sector = dir
+                .get(index as usize)
+                .map(|e| e.sector)
+                .ok_or_else(|| Error::other(format!("slot {} does not exist", index + 1)))?;
+            write_backup(&onboard::backup(h, id, product_id)?)?;
+            if let Some((stages, default, shift, rate)) = &dpi {
+                if !stages.is_empty() {
+                    onboard::write_dpi_table(h, sector, stages, *default, *shift, *rate, &info)?;
+                }
+            }
+            if !leds.is_empty() {
+                onboard::write_leds(h, sector, leds, &info)?;
+            }
+            if !buttons.is_empty() {
+                let mut raw = onboard::read_sector(h, sector, size, true)?;
+                for (i, b) in buttons {
+                    if *i < info.button_count {
+                        let at = onboard::button_offset(*i, false);
+                        raw[at..at + 4].copy_from_slice(&b.encode());
+                    }
+                }
+                onboard::write_sector(h, sector, &raw)?;
+            }
+            Ok(())
+        })?;
+        inner.with_handle(id, reload_onboard_profile)
+    }
+
+    /// The MR key's LED, for recording feedback.
+    pub fn set_mr_led(&self, id: &str, on: bool) {
+        let mut inner = self.inner.lock();
+        let Some(mr) = inner.mkeys.get(id).and_then(|m| m.mr) else { return };
+        let _ = inner.with_handle(id, |h| h.call(mr, features::mr::FN_SET_LED, &[on as u8], ReportKind::Long).map(|_| ()));
+    }
+
+    /// The keyboard's current M-state (1-3), for binding a recording to it.
+    pub fn m_state(&self, id: &str) -> u8 {
+        self.inner.lock().mkeys.get(id).map(|m| m.state).unwrap_or(1)
+    }
+
+    /// Game Mode: disables exactly these HID keyboard usages (0x4522).
+    pub fn set_disabled_keys(&self, id: &str, usages: &[u8]) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.demo {
+            return Ok(());
+        }
+        inner.with_handle(id, |h| features::set_disabled_keys(h, usages))
+    }
+
     pub fn enumerate_features(&self, id: &str) -> Result<Vec<(u16, u8, u8)>> {
         let mut inner = self.inner.lock();
         inner.with_handle(id, |h| h.enumerate_features())
@@ -1045,47 +1316,72 @@ impl Inner {
                 vec![hidpp::DEVICE_INDEX_WIRED]
             };
 
+            // Two receivers of one model: tell their children apart by port.
+            let twin = endpoint.is_receiver
+                && endpoints.iter().filter(|e| e.is_receiver && e.address.product_id == endpoint.address.product_id).count() > 1;
+            let port = if twin { hidpp::usb_port(&endpoint.address.path) } else { None };
+
             for index in indices {
                 let mut address = endpoint.address.clone();
                 address.device_index = index;
-                let id = address.id();
+                address.port = port.clone();
+                let address_id = address.id();
 
-                let handle = match self.handles.entry(id.clone()) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        match Handle::open(api, address.clone()) {
-                            Ok(h) => e.insert(h),
-                            Err(err) => {
-                                log::debug!("cannot open {}: {err}", address.path);
-                                let label = endpoint
-                                    .hid_product
-                                    .clone()
-                                    .or_else(|| {
-                                        registry::name_for(address.product_id).map(str::to_owned)
-                                    })
-                                    .unwrap_or_else(|| format!("{:04x}", address.product_id));
-                                if !unopenable.contains(&label) {
-                                    unopenable.push(label);
-                                }
-                                continue;
-                            }
+                // Known connection: reuse its handle under the device's id.
+                if let Some(id) = self.aliases.get(&address_id).cloned().filter(|id| self.handles.contains_key(id)) {
+                    let handle = self.handles.get_mut(&id).expect("checked");
+                    if handle.address.id() != address_id || handle.ping().is_err() {
+                        if handle.address.id() == address_id {
+                            self.handles.remove(&id);
                         }
+                        self.aliases.remove(&address_id);
+                        continue;
+                    }
+                    let mut snapshot = self
+                        .snapshots
+                        .remove(&id)
+                        .unwrap_or_else(|| DeviceSnapshot::placeholder(&address, String::new(), DeviceKind::Other));
+                    probe(handle, &mut snapshot, endpoint);
+                    snapshot.id = id.clone();
+                    self.snapshots.insert(id.clone(), snapshot);
+                    seen.push(id);
+                    continue;
+                }
+
+                let mut handle = match Handle::open(api, address.clone()) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        log::debug!("cannot open {}: {err}", address.path);
+                        let label = endpoint
+                            .hid_product
+                            .clone()
+                            .or_else(|| registry::name_for(address.product_id).map(str::to_owned))
+                            .unwrap_or_else(|| format!("{:04x}", address.product_id));
+                        if !unopenable.contains(&label) {
+                            unopenable.push(label);
+                        }
+                        continue;
                     }
                 };
 
                 // A receiver slot with nothing paired into it never answers.
                 if handle.ping().is_err() {
-                    self.handles.remove(&id);
                     continue;
                 }
 
-                let mut snapshot = self
-                    .snapshots
-                    .remove(&id)
-                    .unwrap_or_else(|| DeviceSnapshot::placeholder(&address, String::new(), DeviceKind::Other));
-
-                let handle = self.handles.get_mut(&id).expect("just inserted");
-                probe(handle, &mut snapshot, endpoint);
+                let mut snapshot = DeviceSnapshot::placeholder(&address, String::new(), DeviceKind::Other);
+                probe(&mut handle, &mut snapshot, endpoint);
+                let id = device_identity(&snapshot)
+                    .filter(|id| !seen.contains(id))
+                    .unwrap_or_else(|| address_id.clone());
+                if let Some(old) = self.snapshots.remove(&id) {
+                    // Same device, new connection: keep what is not re-read.
+                    snapshot.onboard_mode = snapshot.onboard_mode.or(old.onboard_mode);
+                }
+                snapshot.id = id.clone();
+                self.aliases.retain(|_, v| *v != id);
+                self.aliases.insert(address_id, id.clone());
+                self.handles.insert(id.clone(), handle);
                 self.snapshots.insert(id.clone(), snapshot);
                 seen.push(id);
             }
@@ -1127,8 +1423,10 @@ impl Inner {
         self.wheels.retain(|id, _| seen.contains(id));
         self.plans.retain(|id, _| seen.contains(id));
         self.spy_index.retain(|id, _| seen.contains(id));
+        self.gkey_index.retain(|id, _| seen.contains(id));
         self.onboard_written.retain(|id, _| seen.contains(id));
         self.snapshots.retain(|id, _| seen.contains(id));
+        self.aliases.retain(|_, id| seen.contains(id));
         self.order = seen;
 
         if self.order.is_empty() {
@@ -1162,8 +1460,20 @@ impl Inner {
     }
 
     fn with_handle<T>(&mut self, id: &str, f: impl FnOnce(&mut Handle) -> Result<T>) -> Result<T> {
-        let handle = self.handles.get_mut(id).ok_or(Error::NotConnected)?;
-        let result = f(handle);
+        let result = match self.handles.get_mut(id) {
+            Some(handle) => f(handle),
+            None => Err(Error::NotConnected),
+        };
+        // Moved between cable and receiver: the old path is gone ("no such
+        // device") or answers "busy" for the device that left it. Find the
+        // device again — its id does not change — so the next call reaches it.
+        if matches!(&result, Err(e) if connection_lost(e)) {
+            log::info!("{id}: connection changed, rescanning");
+            self.handles.remove(id);
+            self.aliases.retain(|_, v| v != id);
+            self.refresh();
+            return result;
+        }
         if let Err(Error::NotConnected) = result {
             self.handles.remove(id);
             if let Some(snap) = self.snapshots.get_mut(id) {
@@ -1224,22 +1534,34 @@ impl Inner {
 /// The factory button descriptors for a product, read from the oldest backup
 /// OpenGHub took of it — the first backup happens before the first write, so
 /// it is the table the mouse shipped with. Empty when there is no backup.
-pub fn factory_buttons(product_id: u16, count: usize) -> Vec<crate::hidpp::onboard::Button> {
+/// The button table of the oldest backup of any of `product_ids` — the state
+/// before OpenGHub first wrote anything. A device has one id per connection
+/// (a G915 is `c33e` wired and `b354` wireless), and the oldest backup may
+/// have been taken under either.
+pub fn factory_buttons(product_ids: &[u16], count: usize) -> Vec<crate::hidpp::onboard::Button> {
     use crate::hidpp::onboard::{self, Button, BUTTONS_OFFSET};
     let Some(dir) = crate::artwork::dir().parent().map(|d| d.join("backups")) else {
         return vec![];
     };
-    let prefix = format!("{product_id:04x}-");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+    // `<pid>-<unix seconds>.json`; the oldest stamp wins across ids.
+    let stamp_of = |p: &std::path::Path| -> Option<(u64, u16)> {
+        let name = p.file_stem()?.to_str()?;
+        let (pid, stamp) = name.split_once('-')?;
+        let pid = u16::from_str_radix(pid, 16).ok()?;
+        product_ids.contains(&pid).then_some(())?;
+        Some((stamp.parse().ok()?, pid))
+    };
+    let oldest = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with(&prefix)).unwrap_or(false))
-                .collect()
+                .filter_map(|p| stamp_of(&p).map(|s| (s, p)))
+                .min_by_key(|(s, _)| s.0)
+                .map(|(_, p)| p)
         })
-        .unwrap_or_default();
-    files.sort();
-    let Some(oldest) = files.first() else {
+        .ok()
+        .flatten();
+    let Some(oldest) = oldest else {
         return vec![];
     };
     let Ok(text) = std::fs::read_to_string(oldest) else {
@@ -1286,6 +1608,23 @@ pub fn write_backup(backup: &crate::hidpp::onboard::MemoryBackup) -> Result<std:
         .ok_or_else(|| Error::other("could not resolve the data directory"))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::other(format!("could not create {}: {e}", dir.display())))?;
+    // Identical to the newest backup of this product: nothing new to keep.
+    let prefix = format!("{:04x}-", backup.product_id);
+    let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+            .max()
+    });
+    if let Some(path) = newest {
+        let same = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<crate::hidpp::onboard::MemoryBackup>(&t).ok())
+            .is_some_and(|old| old.sectors == backup.sectors);
+        if same {
+            return Ok(path);
+        }
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1319,6 +1658,30 @@ fn wheel_evdev_nodes(hidraw_path: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A keyboard's M-key state; see `Inner::mkeys`.
+struct MKeys {
+    index: Option<u8>,
+    /// 0x8030, the MR key.
+    mr: Option<u8>,
+    count: u8,
+    state: u8,
+    assignments: Vec<Assignment>,
+    macros: Vec<MacroDef>,
+}
+
+/// Errors that mean the handle no longer reaches the device.
+pub fn connection_lost(e: &Error) -> bool {
+    matches!(e, Error::NotConnected | Error::Hid(_))
+        || matches!(e, Error::Protocol(p) if p.0 == hidpp::ProtocolError::BUSY)
+}
+
+/// A connection-independent id: the device's own highest model id (its wired
+/// product id — `c095` for a G502 X PLUS, `c33e` for a G915), in the form a
+/// wired connection always had, so existing profiles keep working.
+fn device_identity(snapshot: &DeviceSnapshot) -> Option<String> {
+    snapshot.model_ids.iter().max().map(|pid| format!("046d:{pid:04x}:255"))
 }
 
 fn probe(handle: &mut Handle, snapshot: &mut DeviceSnapshot, endpoint: &hidpp::Endpoint) {
@@ -1386,6 +1749,9 @@ fn probe(handle: &mut Handle, snapshot: &mut DeviceSnapshot, endpoint: &hidpp::E
         lighting: handle.supports(features::lighting::ID_COLOR_LED_EFFECTS)
             || handle.supports(features::lighting::ID_RGB_EFFECTS),
         onboard_memory: handle.supports(0x8100),
+        per_key: handle.supports(features::per_key::ID) && snapshot.kind == DeviceKind::Keyboard,
+        // Done in software (gamemode.rs), so any keyboard can have it.
+        game_mode: snapshot.kind == DeviceKind::Keyboard,
         wheel: false,
     };
 

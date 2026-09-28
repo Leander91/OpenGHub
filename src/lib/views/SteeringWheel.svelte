@@ -70,8 +70,11 @@
   // Seed once per device; writing settings back must not re-seed.
   $effect(() => {
     const id = device.id;
-    if (seededFor === id) return;
-    seededFor = id;
+    // Per profile too: switching profiles with this page open must show the
+    // new profile's settings, or the next edit saves the old ones into it.
+    const key = `${configStore.activeProfileId}:${id}`;
+    if (seededFor === key) return;
+    seededFor = key;
     untrack(() => {
       const saved = configStore.deviceProfile(id).wheel;
       if (saved) settings = { ...DEFAULTS, ...saved };

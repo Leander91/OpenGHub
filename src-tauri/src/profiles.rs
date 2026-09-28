@@ -16,7 +16,8 @@ use crate::hidpp::Error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LightingSettings {
-    /// `off` | `fixed` | `breathing` | `cycle` | `screen` | `audio`
+    /// `off` | `fixed` | `breathing` | `cycle` | `wave` | `ripple` |
+    /// `screen` | `audio`
     pub effect: String,
     /// `#rrggbb`
     pub color: String,
@@ -25,6 +26,9 @@ pub struct LightingSettings {
     /// Parameters of a software effect (`screen` / `audio`), run by the app.
     #[serde(default)]
     pub software: Option<crate::lightsync::SoftwareEffect>,
+    /// Colour wave direction code (1 = horizontal).
+    #[serde(default)]
+    pub direction: Option<u8>,
 }
 
 impl Default for LightingSettings {
@@ -35,6 +39,7 @@ impl Default for LightingSettings {
             brightness: 100,
             rate_ms: 5000,
             software: None,
+            direction: None,
         }
     }
 }
@@ -137,7 +142,71 @@ pub struct DeviceProfile {
     /// Steering wheel settings, for wheels.
     #[serde(default)]
     pub wheel: Option<crate::wheel::WheelSettings>,
+    /// Freestyle colours by LED id (as a string key), `#rrggbb`. Shown when
+    /// a zone's effect is `freestyle`; keys not listed are off.
+    #[serde(default)]
+    pub per_key: std::collections::HashMap<String, String>,
+    /// Game Mode: HID keyboard usages to disable while it is on. `None` means
+    /// G HUB's default, the Windows and Menu keys.
+    #[serde(default)]
+    pub game_mode_keys: Option<Vec<u8>>,
+    /// The keyboard animation, shown when a zone's effect is `animation`.
+    #[serde(default)]
+    pub animation: Option<crate::animation::Animation>,
+    /// Command lighting colours chosen by the user, by command group; an
+    /// empty string is G HUB's NO COLOR. Groups not listed use the game's own.
+    #[serde(default)]
+    pub command_colors: std::collections::HashMap<String, String>,
 }
+
+/// Copies the fields of one lockable feature from `from` into `to`.
+pub fn copy_feature(from: &DeviceProfile, to: &mut DeviceProfile, feature: &str) {
+    match feature {
+        "lighting" => {
+            to.lighting = from.lighting.clone();
+            to.lighting_zones = from.lighting_zones.clone();
+            to.per_key = from.per_key.clone();
+            to.animation = from.animation.clone();
+            to.command_colors = from.command_colors.clone();
+        }
+        "assignments" => {
+            to.assignments = from.assignments.clone();
+            to.macros = from.macros.clone();
+        }
+        "dpi" => {
+            to.dpi_stages = from.dpi_stages.clone();
+            to.active_stage = from.active_stage;
+            to.shift_stage = from.shift_stage;
+            to.report_rate_hz = from.report_rate_hz;
+        }
+        "gamemode" => to.game_mode_keys = from.game_mode_keys.clone(),
+        _ => {}
+    }
+}
+
+impl Config {
+    /// Spreads the locked features of `device_id` from profile `source` to
+    /// every other profile, creating the device entry where missing.
+    pub fn propagate_locks(&mut self, device_id: &str, source: &str) {
+        let Some(features) = self.settings.locks.get(device_id).cloned() else { return };
+        if features.is_empty() {
+            return;
+        }
+        let Some(from) = self.profiles.iter().find(|p| p.id == source).and_then(|p| p.devices.get(device_id)).cloned() else {
+            return;
+        };
+        for p in self.profiles.iter_mut().filter(|p| p.id != source) {
+            let to = p.devices.entry(device_id.to_string()).or_default();
+            for f in &features {
+                copy_feature(&from, to, f);
+            }
+        }
+    }
+}
+
+/// Keys Game Mode always disables when nothing else is chosen: both Windows
+/// keys and the Menu key, as in G HUB.
+pub const GAME_MODE_DEFAULT_KEYS: [u8; 3] = [0xe3, 0xe7, 0x65];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +291,13 @@ pub struct Settings {
     /// them live.
     #[serde(default)]
     pub onboard_mode_devices: Vec<String>,
+    /// Keyboards with Game Mode switched on.
+    #[serde(default)]
+    pub game_mode_devices: Vec<String>,
+    /// G HUB's per-profile locks: device id → features (`lighting`,
+    /// `assignments`, `dpi`, `gamemode`) kept the same in every profile.
+    #[serde(default)]
+    pub locks: std::collections::HashMap<String, Vec<String>>,
     /// Per-device settings that are not part of a profile (G HUB's device
     /// settings screen): power management, low-battery mode, button layout.
     #[serde(default)]
@@ -292,6 +368,8 @@ impl Default for Settings {
             wheel_driver: true,
             screen_restore_token: None,
             onboard_mode_devices: Vec::new(),
+            game_mode_devices: Vec::new(),
+            locks: Default::default(),
             device_settings: Default::default(),
             active_profile_per_app: Default::default(),
             udev_setup_dismissed: false,
@@ -413,6 +491,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn locked_features_spread_to_every_profile() {
+        let mut cfg = Config::default();
+        let mut game = cfg.profiles[0].clone();
+        game.id = "game".into();
+        game.devices.clear();
+        cfg.profiles.push(game);
+        let dev = "046d:c33e:255";
+        cfg.profiles[0].devices.insert(dev.into(), DeviceProfile { dpi_stages: vec![800], game_mode_keys: Some(vec![0x39]), ..Default::default() });
+        cfg.settings.locks.insert(dev.into(), vec!["gamemode".into()]);
+        cfg.propagate_locks(dev, "default");
+        let other = &cfg.profiles[1].devices[dev];
+        assert_eq!(other.game_mode_keys, Some(vec![0x39]));
+        // Unlocked features stay per profile.
+        assert!(other.dpi_stages.is_empty());
+    }
+
+    #[test]
     fn default_config_has_desktop_profile() {
         let cfg = Config::default();
         assert_eq!(cfg.active_profile, "default");
@@ -436,6 +531,10 @@ mod tests {
                 assignments: vec![],
                 macros: vec![],
                 wheel: None,
+                per_key: Default::default(),
+                game_mode_keys: None,
+                animation: None,
+                command_colors: Default::default(),
             },
         );
         let text = serde_json::to_string(&cfg).unwrap();

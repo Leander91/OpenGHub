@@ -31,6 +31,15 @@ Desktop takes over. **Settings → "Switch profiles with games"** turns this off
 Note that none of this is Logitech's *device* depot channel, which is a separate, internal,
 token-gated service (see the section on device artwork).
 
+Launchers and runtime helpers are ignored: Gaijin's launcher carries War Thunder's `SteamAppId`
+and stays open after the game quits, which would otherwise keep the game's profile active.
+Installed games that the database does not list become their own application
+(`steam:<appid>`), so they can still carry a profile and be detected.
+
+**Per-profile locks** (the lock on the lighting, assignments, DPI and Game Mode pages) keep one
+feature of a device the same in every profile: it is copied from the active profile on lock, on
+every save, and into profiles created later.
+
 ## The Games tab
 
 G HUB's Games tab is a launcher: every installed game as a poster tile, filtered by store.
@@ -44,6 +53,10 @@ OpenGHub reads the launchers that exist on Linux, all read-only:
 - **Epic Games / GOG** — through Heroic's `store_cache/{legendary,gog}_library.json`.
 - **Lutris** — `lutris --list-games --installed --json`; entries whose runner is Steam are
   skipped because Steam already lists them.
+- **Faugus Launcher** — `~/.local/share/faugus-launcher/games.json` (or its Flatpak twin), with
+  its icons and covers, play time and last played; launched with `faugus-launcher --game <id>`.
+  Its games run under Proton without a Steam app id, so profile switching finds them by
+  executable name (it works for World of Warcraft through Battle.net).
 - **Manually installed** — any executable, added with **+** or under *Manage*; stored in the
   config with an optional cover.
 
@@ -109,3 +122,11 @@ scripts work as they are:
 Button events come from the `0x8110` button spy, which is switched on for every mouse while a
 script runs even when nothing is assigned. A device in on-board memory mode keeps its buttons
 to itself, so the console says so instead of silently seeing nothing.
+
+## Macros
+
+Macro types run as G HUB's do: *no repeat*, *repeat while holding*, *toggle* and *sequence* (press,
+hold, release sections). Besides keys, mouse buttons and delays, a macro can type **text** (with
+the desktop's keyboard layout, via libxkbcommon loaded at run time, so å, ö and @ come out right),
+**launch an application** and send a **system** command. Those three, and the looping types, are
+played by OpenGHub and never written to onboard memory.

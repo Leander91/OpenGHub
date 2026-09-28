@@ -1,5 +1,6 @@
 <script lang="ts">
   /** Sensitivity (DPI) — stages, pointer speed and report rate. */
+  import ProfileLock from "$lib/components/ProfileLock.svelte";
   import { untrack } from "svelte";
   import * as api from "$lib/api";
   import DeviceWorkspace from "$lib/components/DeviceWorkspace.svelte";
@@ -34,8 +35,11 @@
   // state the user is editing — an infinite loop.
   $effect(() => {
     const id = device.id;
-    if (seededFor === id) return;
-    seededFor = id;
+    // Per profile too: switching profiles with this page open must show the
+    // new profile's settings, or the next edit saves the old ones into it.
+    const key = `${configStore.activeProfileId}:${id}`;
+    if (seededFor === key) return;
+    seededFor = key;
 
     untrack(() => {
       const saved = configStore.deviceProfile(id);
@@ -132,6 +136,7 @@
 
 <DeviceWorkspace title="Sensitivity (DPI)" stageAlign="top">
   {#snippet panel()}
+    <ProfileLock deviceId={device.id} feature="dpi" />
     <p class="copy">
       DPI is the speed of your mouse on the screen. Use DPI buttons on your mouse to quickly
       change the DPI speed.

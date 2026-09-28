@@ -44,6 +44,42 @@ Two things about `0x8070` that cost real debugging time:
   then ignored. OpenGHub switches to host mode via `0x8100` first, as G HUB does. Use
   `cargo run --example lighting` to dump what a zone actually supports.
 
+## 0x8071 RGB Effects
+
+Newer devices (G502 X, G915) have only `0x8071`. It describes zones and effects through one
+`getInfo` function (`[zone|0xff, effect|0xff, 0]`; the zone reply carries its location one byte
+later than 0x8070's) and sets them with `setRgbClusterEffect`, whose payload matches
+`setZoneEffect`. Verified on a G502 X PLUS and a G915, wired and over LIGHTSPEED:
+
+- The trailing byte must be `1`. With `0` the write is acknowledged and nothing changes.
+- A fixed colour also wants ramp byte `0x02`.
+- The host takes the LEDs with `manageSwControl` (fn 5) `[1, 3, events]`. Over LIGHTSPEED the
+  events byte matters: the G502 X obeys only `5` (OpenRGB's generic value), the G915 only `7`
+  (OpenRGB's G915 value). Keyboards are told apart by `0x8040`.
+- With power management handed over, a wireless G915 sat in `rgbPowerMode` (fn 8) 2 and lit only
+  its logo; mode 1 lights everything. Its `0x8040` brightness also came up as 0.
+- A G915 needs host mode (`0x8100`) for any of this to show.
+- Keyboard-only effects: colour wave (`0x04`, period split low/high around a direction byte and an
+  intensity) and ripple (`0x0b`, colour and a 2–200 ms rate). Only the horizontal wave direction
+  (`1`) is confirmed so far.
+
+## Per-key lighting, animations and command lighting
+
+`0x8081` sets individual keys: fn 1 takes up to four `[led, r, g, b]`, fn 6 one colour and up to
+13 LED ids, both `0xff`-terminated when shorter; fn 7 commits. The cluster effects are switched
+off first. LED ids on the G915 are `usage − 3` for ordinary keys, `usage − 0x78` for modifiers,
+`0xb3 + n` for G-keys, `0xd2` for the logo, and their own codes for the media keys — the
+numbering OpenRGB documents. `src/lib/keyboards/g915.ts` is OpenGHub's own drawn ISO map.
+
+- **Freestyle** paints keys on that map; the colours live in the profile (`perKey`).
+- **Animations** are Freestyle frames played by `animation.rs`: per frame duration, fade or cut,
+  cycle / reverse / bounce / random. After the first frame only changed keys are written, which
+  keeps a wireless keyboard responsive.
+- **Command lighting** lights a game's command keys (from the application database's keystrokes)
+  in their group colours; each group's colour can be overridden or set to none.
+
+Every profile's lighting is written on profile switch, not only its software effects.
+
 ## Where G HUB's artwork really comes from
 
 Reverse-engineered from a G HUB 39.1 `C:\ProgramData\LGHUB` tree, a Wireshark capture of a

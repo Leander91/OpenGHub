@@ -23,6 +23,13 @@ const devices: Device[] = [
     zones: 1,
     onboard: true,
   }),
+  makeDevice("demo-g915", "G915 LIGHTSPEED", "keyboard", 0xc33e, {
+    connection: "wired",
+    battery: 90,
+    zones: 2,
+    onboard: true,
+    perKey: true,
+  }),
   makeDevice("demo-prox2", "PRO X 2 LIGHTSPEED", "headset", 0x0afe, {
     connection: "wireless",
     battery: 17,
@@ -45,6 +52,8 @@ interface Options {
   zones?: number;
   onboard?: boolean;
   wheel?: boolean;
+  /** Per-key lighting (and Game Mode, as for any keyboard). */
+  perKey?: boolean;
 }
 
 function makeDevice(
@@ -73,6 +82,8 @@ function makeDevice(
       battery: o.battery !== undefined,
       lighting: !!o.zones,
       onboardMemory: !!o.onboard,
+      perKey: !!o.perKey,
+      gameMode: kind === "keyboard",
       wheel: !!o.wheel,
     },
     battery:
@@ -390,6 +401,27 @@ export async function mockInvoke<T>(command: string, args: Record<string, unknow
         effects: [0x00, 0x01, 0x03, 0x0a],
       })) as T;
     }
+
+    case "set_profile_lock": {
+      const locks = (config.settings.locks ??= {});
+      const id = args.deviceId as string;
+      const list = (locks[id] ?? []).filter((f) => f !== args.feature);
+      if (args.locked) list.push(args.feature as string);
+      locks[id] = list;
+      return persist() as T;
+    }
+
+    case "set_game_mode": {
+      const id = args.deviceId as string;
+      const on = (config.settings.gameModeDevices ?? []).filter((d) => d !== id);
+      if (args.on) on.push(id);
+      config.settings.gameModeDevices = on;
+      return persist() as T;
+    }
+
+    case "set_per_key_lighting":
+    case "reapply_lighting":
+      return undefined as T;
 
     case "save_settings":
       config.settings = JSON.parse(JSON.stringify(args.settings)) as Config["settings"];

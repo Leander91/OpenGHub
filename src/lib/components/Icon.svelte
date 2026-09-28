@@ -105,6 +105,9 @@
     keycap:
       '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M8 12h8"/><path d="M13 9l3 3-3 3"/>',
 
+    joystick:
+      '<rect x="4.5" y="15.5" width="15" height="5" rx="1.5"/><path d="M12 15.5V9"/><circle cx="12" cy="6.5" r="2.8"/>',
+
     // -- games library ------------------------------------------------------
     library:
       '<rect x="3.5" y="6.5" width="14" height="14" rx="2"/><path d="M7.5 3.5h11a2 2 0 0 1 2 2v11"/><path d="M8.5 11l5 2.5-5 2.5z"/>',
@@ -125,6 +128,8 @@
       '<path d="M12 3.5l7.5 4.5v8L12 20.5 4.5 16V8z"/><path d="M12 8v8"/><path d="M8.5 10l7 4M15.5 10l-7 4"/>',
     manual:
       '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M7.5 9l3 3-3 3"/><path d="M12.5 15h4"/>',
+    faugus:
+      '<rect x="4.5" y="4.5" width="15" height="15" rx="3"/><path d="M9 16V8h6"/><path d="M9 12h4.5"/>',
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
 
     // G HUB's pedals glyph: three pedal plates.
