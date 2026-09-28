@@ -681,9 +681,28 @@ fn dpi_action(app: &tauri::AppHandle, device_id: &str, action: &remap::Action, p
     let manager = app.state::<DeviceManager>();
     let cfg = store.get();
     let Some(profile) = cfg.profiles.iter().find(|p| p.id == cfg.active_profile) else { return };
-    let dp = profile.devices.get(device_id).cloned().unwrap_or_default();
+    let mut dp = profile.devices.get(device_id).cloned().unwrap_or_default();
     if dp.dpi_stages.is_empty() {
-        return;
+        // A profile that never set DPI gets the device's factory ladder, as a
+        // fresh G HUB profile does, saved so the Sensitivity page shows it.
+        let ids: Vec<u16> = manager
+            .snapshot(device_id)
+            .map(|s| s.model_ids.iter().copied().chain([s.product_id]).collect())
+            .unwrap_or_default();
+        let Some((stages, default, shift)) = state::factory_dpi(&ids) else { return };
+        dp.dpi_stages = stages;
+        dp.active_stage = default;
+        dp.shift_stage = Some(shift);
+        let (id, pid, seeded) = (device_id.to_string(), profile.id.clone(), dp.clone());
+        let _ = store.update(move |c| {
+            if let Some(p) = c.profiles.iter_mut().find(|p| p.id == pid) {
+                let d = p.devices.entry(id.clone()).or_default();
+                d.dpi_stages = seeded.dpi_stages.clone();
+                d.active_stage = seeded.active_stage;
+                d.shift_stage = seeded.shift_stage;
+            }
+        });
+        let _ = app.emit(commands::EVENT_CONFIG_CHANGED, store.get());
     }
     let last = dp.dpi_stages.len() - 1;
     let current = dp.active_stage.min(last);
@@ -713,6 +732,7 @@ fn dpi_action(app: &tauri::AppHandle, device_id: &str, action: &remap::Action, p
         }
         _ => current,
     };
+    log::debug!("{device_id}: {action:?} stage {current} → {next} of {:?}", dp.dpi_stages);
     if next == current && !matches!(action, Action::DpiDefault) {
         return;
     }
@@ -746,6 +766,7 @@ fn next_profile(app: &tauri::AppHandle) {
     }
     let pos = enabled.iter().position(|p| p.id == cfg.active_profile).unwrap_or(0);
     let next = enabled[(pos + 1) % enabled.len()].id.clone();
+    log::info!("profile cycle: '{}' → '{}'", enabled[pos].name, enabled[(pos + 1) % enabled.len()].name);
     let _ = store.update(|c| c.active_profile = next);
     let _ = app.emit(commands::EVENT_CONFIG_CHANGED, store.get());
     apply_all_profiles(app);

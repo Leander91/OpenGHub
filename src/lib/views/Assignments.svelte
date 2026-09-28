@@ -877,6 +877,8 @@
             oncontextmenu={(e) => resetControl(e, control.id)}
             data-control={control.id}
           >
+            <!-- Which button this is (G8, Left click…), then what it does. -->
+            <span class="callout-name">{control.label}</span>
             <span class="callout-binding" class:bound={!!bound} title={control.label}>
               {bound?.label ?? control.fallback}
             </span>
@@ -1367,6 +1369,15 @@
   }
 
   /* G HUB prints the bound command as the label: white by default, yellow when changed. */
+  .callout-name {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dimmer);
+  }
+
   .callout-binding {
     font-size: 13px;
     font-weight: 700;
